@@ -23,21 +23,61 @@
 
 #define EEPROM_OFFSET_MULTIPLIER		0
 
-#define led_enable()		PORTD |= _BV(5);
-#define led_disable()		PORTD &= ~_BV(5);
+//===========================================================================
+// pin definitions
+//===========================================================================
+#define SPI_MOSI_PORT 	D
+#define SPI_MOSI_PIN	0    		// PD1 - нога 31
+#define SPI_MISO_PORT	D
+#define SPI_MISO_PIN	1    		// PB4 - нога 30
+#define SPI_SCK_PORT	C
+#define SPI_SCK_PIN		6    		// PB3 - нога 29
+#define SPI_SS_PORT		C
+#define SPI_SS_PIN		5    		// PB2 - нога 28
+
+#define LED_PORT		C
+#define LED_PIN			1			// PC1 - нога 24
+
+#define PS2_CLK_PORT	B			// PB0 - нога 1
+#define PS2_CLK_PIN		0
+#define PS2_DATA_PORT	D			// PD0 - нога 8
+#define PS2_DATA_PIN	0
+
+#define COM_SEL1_PORT   C
+#define COM_SEL1_PIN    0			// PC0 - нога 23
+#define COM_SEL2_PORT   B
+#define COM_SEL2_PIN    1			// PB1 - нога 13
+
+#define WHEEL_SEL_PORT  B
+#define WHEEL_SEL_PIN   2			// PB2 - нога 14
+
+#define DUTY_SEL1_PORT  B
+#define DUTY_SEL1_PIN   0			// PB0 - нога 12
+#define DUTY_SEL2_PORT  D
+#define DUTY_SEL2_PIN   7			// PD7 - нога 11
+
+#define RATE_SEL1_PORT  D
+#define RATE_SEL1_PIN   6			// PD6 - нога 10
+#define RATE_SEL2_PORT  D
+#define RATE_SEL2_PIN   5			// PD5 - нога 9
+
 
 //===========================================================================
-// SPI pin definitions
+// ADC каналы
 //===========================================================================
-#define SPI_MOSI_PORT  B
-#define SPI_MOSI_PIN   5    // PB5 - нога 32 (MOSI)
-#define SPI_MISO_PORT  B
-#define SPI_MISO_PIN   4    // PB4 - нога 31 (MISO) 
-#define SPI_SCK_PORT   B
-#define SPI_SCK_PIN    3    // PB3 - нога 30 (SCK)
-#define SPI_SS_PORT    B
-#define SPI_SS_PIN     2    // PB2 - нога 29 (SS)
+#define ADC_CHANNEL_3  3			// PC3 - нога 25
+#define ADC_CHANNEL_4  4			// PC4 - нога 26  
+#define ADC_CHANNEL_5  5			// PC5 - нога 27
 
+//===========================================================================
+// Светодиод
+//===========================================================================
+#define led_enable()		PORT(LED_PORT) |= _BV(LED_PIN);
+#define led_disable()		PORT(LED_PORT) &= ~_BV(LED_PIN);
+
+//===========================================================================
+// Soft SPI
+//===========================================================================
 #define spi_mosi_high()    PORT(SPI_MOSI_PORT) |= _BV(SPI_MOSI_PIN)
 #define spi_mosi_low()     PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN)
 #define spi_sck_high()     PORT(SPI_SCK_PORT) |= _BV(SPI_SCK_PIN)
@@ -46,19 +86,35 @@
 #define spi_ss_low()       PORT(SPI_SS_PORT) &= ~_BV(SPI_SS_PIN)
 
 //===========================================================================
+// Select UART base address
+//===========================================================================
+#define SELECT_COM1 0
+#define SELECT_COM2 1
+#define SELECT_COM3 2
+#define SELECT_COM4 3
+
+//===========================================================================
+// Select mouse Duty cycles
+//===========================================================================
+#define DUTY_100 0
+#define DUTY_75  1
+#define DUTY_50  2
+
+//===========================================================================
+// Select data rate
+//===========================================================================
+#define DATA_RATE_100 0
+#define DATA_RATE_50  1
+#define DATA_RATE_25  2
+
+//===========================================================================
 // PS/2 порт
 //===========================================================================
-
 #define PS2_BUF_SIZE 256  // Размер приёмного буфера PS/2 порта
 
-#define PS2_CLK_PORT  D // Ножка к которой подлючен тактовый сиг. PS/2
-#define PS2_CLK_PIN   2
-#define PS2_DATA_PORT D // Ножка к которой подлючен сигнал данных PS/2 
-#define PS2_DATA_PIN  4
-
-#define ps2_data()		(PIND & _BV(4))
-#define get_jumper()	(PINB & _BV(2))
-#define get_com_power()	(PIND & _BV(3))
+#define ps2_data()     (PIND & _BV(0))
+#define get_jumper()   (PINB & _BV(2))
+#define get_com_power() (PIND & _BV(3))
 
 enum ps_state_t { 
 	ps2_state_error, 
@@ -75,11 +131,56 @@ volatile uint8_t ps2_rx_buf_w;
 volatile uint8_t ps2_rx_buf_r;
 volatile uint8_t ps2_rx_buf_count;
 
-volatile bool send_rs232_flag;
+volatile bool send_PS2_data_flag;
+//---------------------------------------------------------------------------
+// Обработка джамперов
+uint8_t readCOMsettings(void) {
+	bool t = false;
+	if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 0) &&
+	   ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 1))
+	   	return SELECT_COM2;
+	if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 1) &&
+	   ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0))
+	   	return SELECT_COM4;
 
+	// Перемычки на землю не обнаружены, проверяем перемычу между джамперами
+	DDR(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);	// COM_SEL1 теперь выход
+	PORT(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);	// Запишем туда 0
+	t = ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0);
+	DDR(COM_SEL1_PORT) = ~_BV(COM_SEL1_PIN);    // COM_SEL1 теперь вход
+	if (t)
+		return SELECT_COM3;
+	else
+		return SELECT_COM1;
+}
+
+bool readWheelsettings(void) {
+	if ((PIN(WHEEL_SEL_PORT) & _BV(WHEEL_SEL_PIN)) == 0)
+		return true;
+	return false;
+}
+
+uint8_t readDutysettings(void) {
+	if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 0) &&
+	   ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 1))
+	   	return DUTY_50;
+	if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 1) &&
+	   ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 0))
+	   	return DUTY_75;
+	return DUTY_100;
+}
+
+uint8_t readRatesettings(void) {
+	if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 0) &&
+	   ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 1))
+	   	return DATA_RATE_25;
+	if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 1) &&
+	   ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 0))
+	   	return DATA_RATE_50;
+	return DATA_RATE_100;
+}
 //---------------------------------------------------------------------------
 // Сохранить принятый байт в буфер приёма PS/2 порта. Вызывается только из обработчика прерывания.
-
 void ps2_rx_push(uint8_t c) {
 	// Если буфер переполнен и потерян байт, то программа не сможет правильно 
 	// расшифровать все дальнейшие пакеты, поэтому перезагружаем контроллер.
@@ -97,7 +198,6 @@ void ps2_rx_push(uint8_t c) {
 
 //---------------------------------------------------------------------------
 // Получить байт из приёмного буфера PS/2 порта
-
 uint8_t ps2_read(void) {
 	uint8_t d;
 	
@@ -120,13 +220,21 @@ uint8_t ps2_read(void) {
 
 //---------------------------------------------------------------------------
 // Вычисление бита чётности
+#if 0
 uint8_t parity(uint8_t p) {
-	p = p ^ (p >> 4 | p << 4);
-	p = p ^ (p >> 2);
-	p = p ^ (p >> 1);
+	p ^= (p >> 4 | p << 4);
+	p ^= (p >> 2);
+	p ^= (p >> 1);
 	return (p ^ 1) & 1;
 }
+#endif
+const uint8_t nibble_parity[16] = {
+	0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0
+};
 
+uint8_t parity(uint8_t p) {
+	return nibble_parity[p >> 4] ^ nibble_parity[p & 0x0F];
+}
 //---------------------------------------------------------------------------
 // Изменение тактового сигнала PS/2
 ISR (INT0_vect) {
@@ -196,7 +304,6 @@ ISR (INT0_vect) {
 
 //---------------------------------------------------------------------------
 // Инициализация PS/2
-
 void ps2_init(void) {
 	// Переключаем PS/2 порт на приём
 	DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
@@ -514,7 +621,7 @@ ISR (TIMER0_OVF_vect) {
 	TCNT0 = 0x3d;
 
 	static uint8_t cnt = 0;
-	send_rs232_flag = cnt & 1;
+	send_PS2_data_flag = cnt & 1;
 	cnt++;
 
 	uint8_t b = PINC & 7;
@@ -644,7 +751,7 @@ static void init(void) {
 #if 0
 	DDRB = 0;//_BV(3);//0x08; 
 	PORTB = _BV(2);//_BV(0)|_BV(1)|_BV(2)|_BV(3)|_BV(4)|_BV(5);//0x3F;
-DDRB = _BV(5);	 
+	DDRB = _BV(5);	 
 	DDRC = 0;//0x00; 	 
 	PORTC = _BV(0)|_BV(1)|_BV(2);//0x7F;
 	 
@@ -711,7 +818,7 @@ DDRB = _BV(5);
 static void sentToRs232() {
 	static uint8_t smb1 = 0;
 	
-	send_rs232_flag = false;
+	send_PS2_data_flag = false;
 	if (!rs232_enabled) {
 		return;
 	}
@@ -778,7 +885,7 @@ static void checkBootloader() {
 static void sentToSpi() {
 	static uint8_t smb1 = 0;
 	
-	send_rs232_flag = false;
+	send_PS2_data_flag = false;
 	
 	if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
 		int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
@@ -803,7 +910,29 @@ static void checkJumpers() {
 	}
 }
 
+// Инициализация ADC
+void adc_init(void) {
+    ADMUX = _BV(REFS0);  // AVCC как опорное
+    ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1);  // Включить ADC, делитель 64
+}
+
+// Чтение ADC канала
+uint16_t adc_read(uint8_t channel) {
+    ADMUX = (ADMUX & 0xF0) | (channel & 0x0F);
+    ADCSRA |= _BV(ADSC);
+    while (ADCSRA & _BV(ADSC));
+    return ADC;
+}
+
+void read_adc_channels(uint16_t *adc_values) {
+	adc_values[0] = adc_read(ADC_CHANNEL_3);  // Нога 25
+	adc_values[1] = adc_read(ADC_CHANNEL_4);  // Нога 26
+	adc_values[2] = adc_read(ADC_CHANNEL_5);  // Нога 27
+}
+
 int main(void) {
+	uint16_t adc_values[3] = {0};
+
 	// Восстанавливаем настройки	 
 	ps2m_multiplier = eeprom_read_byte(EEPROM_OFFSET_MULTIPLIER);
 	if (ps2m_multiplier > 2) {
@@ -820,7 +949,10 @@ int main(void) {
 	flash_led();
 
 	for(;;) {
-		if (send_rs232_flag) {
+		// Определяем напряжение на выходах IRQ
+		read_adc_channels(adc_values);
+
+		if (send_PS2_data_flag) {
 #if 0
 			sentToRs232();
 #endif
@@ -833,7 +965,7 @@ int main(void) {
 		// Отправляем компьютеру пакет, если буфер отправки пуст, мышь включена, 
 		// изменились нажатые кнопки или положение мыши
 #if 0
-		if (send_rs232_flag) {
+		if (send_PS2_data_flag) {
 			TCNT0 = 0x3d;
 			sentToRs232();
 		} else if (UCSRA & _BV(RXC)) {	// Если байт готов
@@ -842,7 +974,7 @@ int main(void) {
 #endif
         
 		// Отправляем данные через SPI
-		if (send_rs232_flag) {
+		if (send_PS2_data_flag) {
 			TCNT0 = 0x3d;
 			sentToSpi();
 		}
@@ -863,7 +995,7 @@ int main(void) {
 				ps2m_z = 0; 
 			}
 		}
-                   
+
 		// В случае ошибки перезагружаемся
 		if (ps2_state != ps2_state_error) {
 			wdt_reset();

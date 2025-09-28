@@ -14,7 +14,6 @@
 
 #include <util/delay.h>
 
-#include "debug.h"
 #include "stddef.h"
 
 
@@ -29,8 +28,8 @@
 #define SPI_MISO_PIN	0    		// PD0 - нога 30
 #define SPI_MOSI_PORT 	D
 #define SPI_MOSI_PIN	1    		// PD1 - нога 31
-#define SPI_SS_PORT		D
-#define SPI_SS_PIN		2    		// PD2 - нога 32
+#define DTR_PORT		D
+#define DTR_PIN			2    		// PD2 - нога 32
 #define SPI_SCK_PORT	C
 #define SPI_SCK_PIN		5    		// PC5 - нога 28
 
@@ -64,9 +63,10 @@
 // ADC каналы
 //===========================================================================
 #define ADC_PORT       C
-#define ADC_2  2			// PC2 - нога 25
-#define ADC_3  3			// PC3 - нога 26  
-#define ADC_4  4			// PC4 - нога 27
+#define ADC_2  2			// PC2 - нога 25 IRQ4
+#define ADC_3  3			// PC3 - нога 26 IRQ3
+#define ADC_4  4			// PC4 - нога 27 IRQX
+#define IRQX_threshold 512
 
 //===========================================================================
 // Светодиод
@@ -93,9 +93,9 @@
 //===========================================================================
 // Select UART IRQ
 //===========================================================================
-#define USE_IRQ4 0
-#define USE_IRQ3 1
-#define USE_IRQX 2
+#define USE_IRQ4 1
+#define USE_IRQ3 2
+#define USE_IRQX 3
 
 //===========================================================================
 // Select mouse Duty cycles
@@ -117,7 +117,8 @@
 #define PS2_BUF_SIZE 256  // Размер приёмного буфера PS/2 порта
 #define TIMER0_CONST 0x9F
 
-#define ps2_data()     (PIN(PS2_DATA_PORT) & _BV(PS2_DATA_PIN))
+#define ps2_data()  			(PIN(PS2_DATA_PORT) & _BV(PS2_DATA_PIN))
+#define get_mouse_power_state() (PIN(DTR_PORT) & _BV(DTR_PIN))
 
 enum ps_state_t { 
 	ps2_state_error, 
@@ -135,7 +136,6 @@ volatile uint8_t ps2_rx_buf_r;
 volatile uint8_t ps2_rx_buf_count;
 
 volatile bool send_PS2_data_flag;
-volatile bool mouse_powered = false;
 
 volatile uint8_t opt_com_settings = 0;
 volatile uint8_t opt_wheel_enabled = 0;
@@ -143,7 +143,20 @@ volatile uint8_t opt_duty_settings = 0;
 volatile uint8_t opt_rate_settings = 0;
 volatile uint8_t opt_irq_settings = 0;
 
-volatile bool spi_reset = true;
+volatile bool ps2m_wheel; // Используемый протокол: 0=без колеса, 1=с колесом
+volatile uint8_t ps2m_multiplier; // Масштабирование координат
+volatile uint8_t ps2m_b; // Нажатые кнопки
+volatile int16_t ps2m_x; // Координаты мыши
+volatile int16_t ps2m_y;
+volatile int16_t ps2m_z;
+
+#define SPI_TX_BUFFER_SIZE 256
+
+uint8_t spi_tx_buf[SPI_TX_BUFFER_SIZE];
+volatile uint8_t spi_tx_buf_w;
+volatile uint8_t spi_tx_buf_r;
+volatile uint8_t spi_tx_buf_count;
+volatile bool spi_reset = true; // Необходима инициализация интерфейса soft spi
 volatile bool spi_enabled = false;
 
 //---------------------------------------------------------------------------
@@ -379,7 +392,6 @@ uint8_t ps2_recv(void) {
 
 //---------------------------------------------------------------------------
 // Отправка байта в PS/2 порт с подтверждением
-
 void ps2_send(uint8_t c) {
     ps2_write(c);
     if (ps2_recv() != 0xFA) {
@@ -446,7 +458,7 @@ ISR (USART_TXC_vect) {
 // Изменилось состояние линий DTR или RTS
 ISR (INT0_vect) {
 	// Сохраняем состояние в переменную
-	mouse_powered = (PIN(SPI_SS_PORT) & _BV(SPI_SS_PIN));
+	spi_enabled = get_mouse_power_state();
 
 	// Сохраняем признак сброса
 	spi_reset = true;
@@ -455,19 +467,16 @@ ISR (INT0_vect) {
 //===========================================================================
 // Soft SPI порт
 //===========================================================================
-
-//---------------------------------------------------------------------------
 // Инициализация Soft SPI
 void spi_init(void) {
-    // Настройка пинов как выходы (MOSI, SCK, SS) и входа (MISO)
-    DDR(SPI_MOSI_PORT) 	|= _BV(SPI_MOSI_PIN);
-    DDR(SPI_SCK_PORT) 	|= _BV(SPI_SCK_PIN);
-    DDR(SPI_SS_PORT) 	|= _BV(SPI_SS_PIN);
-    DDR(SPI_MISO_PORT) 	&= ~_BV(SPI_MISO_PIN);
-    
     // Установка начальных состояний
     spi_sck_low();    // SCK низкий
     spi_mosi_low();   // MOSI низкий
+
+    spi_enabled = get_mouse_power_state();
+    if (spi_enabled) {
+        spi_reset = true;
+    }
 }
 
 //---------------------------------------------------------------------------
@@ -524,9 +533,8 @@ void spi_send_mouse_data(int8_t x, int8_t y, int8_t z, uint8_t buttons) {
 }
 
 //===========================================================================
-//  Светодиод
+//  Управление светодиодом
 //===========================================================================
-
 // Включить светодиод
 void flash_led() {
 	led_enable();
@@ -542,14 +550,8 @@ ISR (TIMER2_OVF_vect) {
 }
 
 //===========================================================================
-// Инициализация PS/2 мыши
+// PS/2 мышь
 //===========================================================================
-
-bool     ps2m_wheel;   // Используемый протокол: 0=без колеса, 1=с колесом
-uint8_t  ps2m_multiplier; // Масштабирование координат
-uint8_t  ps2m_b;          // Нажатые кнопки
-int16_t  ps2m_x, ps2m_y, ps2m_z; // Координаты
-
 //---------------------------------------------------------------------------
 // Инициализация PS/2 мыши
 
@@ -607,41 +609,12 @@ void ps2m_process() {
 	}
 }          
 
-//===========================================================================
-// Наплатные кнопки
-//===========================================================================
-/*
-#define BUTTONS_TIMEOUT 50
-
-uint8_t buttons_disabled = 0;    // Таймаут для предотвращения дребезга
-uint8_t pressed_button   = 0xFF; // Последняя нажатая кнопка
-*/
-// Периодический опрос джамперов скорости
-// 80.13 Hz
-ISR (TIMER0_OVF_vect) {
+ISR (TIMER0_OVF_vect) { // 80.13 Hz
 	TCNT0 = TIMER0_CONST;
-/*
-	static uint8_t cnt = 0;
-	send_PS2_data_flag = cnt & 1;
-	cnt++;
 
-	uint8_t b = PINC & 7;
-	if (!buttons_disabled) {
-		if (!(b & _BV(0))) {
-			pressed_button = 0; 
-		} else if (!(b & _BV(1))) {
-			pressed_button = 1; 
-		} else if (!(b & _BV(2))) {
-			pressed_button = 2; 
-		} else {
-			return;
-		}
-	}
-	if (b == 7) {
-		buttons_disabled = BUTTONS_TIMEOUT;
-	}
-	buttons_disabled--;
-*/
+	static uint8_t cnt = 0;
+	// TODO: Использовать информацию о чтении из COM порта для отправки данных
+	send_PS2_data_flag = cnt++ & 1;
 }
 
 //===========================================================================
@@ -782,7 +755,7 @@ static void init(void) {
 	PORT(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);  // Подтяжка на PC0
 
 	DDR(LED_PORT)  |= _BV(LED_PIN);  // pin 24 (PC1) как выход (LED)
-	PORT(LED_PORT) &= ~_BV(LED_PIN);  // PC1 = 0
+	PORT(LED_PORT) |= _BV(LED_PIN);  // PC1 = 1, LED OFF
 
 	DDR(ADC_PORT) &= ~_BV(ADC_2);  // pin 25 (PC2) вход
 	PORT(ADC_PORT) &= ~_BV(ADC_2);  // Отключить подтяжку PC2
@@ -807,8 +780,8 @@ static void init(void) {
 	DDR(SPI_MOSI_PORT) |= _BV(SPI_MOSI_PIN);  // pin 31 (PD1) выход soft SPI MOSI
 	PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN);  // PD1 = 0
 
-	DDR(SPI_SS_PORT) &= ~_BV(SPI_SS_PIN);  // pin 32 (PD2) вход soft SPI SS(DTR|RTS)
-	PORT(SPI_SS_PORT) |= _BV(SPI_SS_PIN); // Подтяжка на PD2
+	DDR(DTR_PORT) &= ~_BV(DTR_PIN);  // pin 32 (PD2) вход DTR|RTS
+	PORT(DTR_PORT) |= _BV(DTR_PIN); // Подтяжка на PD2
 
 	DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);  // pin 1 (PD3) вход (Mouse clock)
 	PORT(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN); // Отключить подтяжку PD3
@@ -854,6 +827,10 @@ static void init(void) {
 	ACSR = _BV(ACD);
 	SFIOR = 0;
 
+	// Инициализация ADC
+	ADMUX = (0 << REFS1) | (0 << REFS0); // Vref = AVCC
+	ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS0);  // Включить ADC, делитель 32
+
 	// Настройка Watchdog-таймера
 	//wdt_enable(WDTO_1S);
 
@@ -862,82 +839,14 @@ static void init(void) {
 }
 
 //---------------------------------------------------------------------------
-#if 0
-//eeprom uint8_t eeprom_ps2m_multiplier;
-
-
-static void sentToRs232() {
-	static uint8_t smb1 = 0;
-	
-	send_PS2_data_flag = false;
-	if (!rs232_enabled) {
-		return;
-	}
-	if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0 || rs232_reset) {
-//				if (rs232_tx_buf_count == 0) {
-		int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
-		ps2m_x -= cx;
-		int8_t cy = ps2m_y < -128 ? -128 : (ps2m_y > 127 ? 127 : ps2m_y); 
-		ps2m_y -= cy;
-		int8_t cz = ps2m_z < -8   ? -8   : (ps2m_z > 7   ?   7 : ps2m_z); 
-		ps2m_z -= cz;
-		
-		smb1 = ps2m_b;
-		rs232m_send(cx, cy, cz, ps2m_b);
-		flash_led();
-	}
-}
-
-static void checkBootloader() {
-	// если мышь отключена, то проверяем команды конфигурации с перехода на загрузчик
-	// '?' -> 'M'		команда определения типа устройства
-	// 'tsbl'			команда перехода на загрузчик
-	// иначе -> '!'
-	
-	static uint8_t goto_bootloader_cnt = 0;
-	char ch = UDR;
-	switch (ch) {
-		case '?':
-			rs232_send('M');
-			goto_bootloader_cnt = 0;
-			break;
-		case 't':
-			goto_bootloader_cnt = 1;
-			break;
-		case 's':
-			if (goto_bootloader_cnt == 1) {
-				goto_bootloader_cnt++;
-			} else {
-				goto_bootloader_cnt = 0;
-			}
-			break;
-		case 'b':
-			if (goto_bootloader_cnt == 2) {
-				goto_bootloader_cnt++;
-			} else {
-				goto_bootloader_cnt = 0;
-			}
-			break;
-		case 'l':
-			if (goto_bootloader_cnt == 3) {
-				wdt_reset();
-				asm("ijmp" :: "z" (0x0E00)); // size = 512 words
-			}
-			goto_bootloader_cnt = 0;
-			break;
-		default:
-			goto_bootloader_cnt = 0;
-			rs232_send('!');
-			break;
-	}
-}
-#endif
-
 static void sentToSpi() {
 	static uint8_t smb1 = 0;
 	
 	send_PS2_data_flag = false;
-	
+
+	if (!spi_enabled)
+				return;
+
 	if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
 		int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
 		ps2m_x -= cx;
@@ -959,35 +868,34 @@ static void checkJumpers() {
 	opt_rate_settings = readRatesettings();
 }
 
-// Инициализация ADC
-void adc_init(void) {
-    ADMUX = _BV(REFS0);  // AVCC как опорное
-    ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1);  // Включить ADC, делитель 64
-}
-
 // Чтение ADC канала
 uint16_t adc_read(uint8_t channel) {
     ADMUX = (ADMUX & 0xF0) | (channel & 0x0F);
     ADCSRA |= _BV(ADSC);
-    while (ADCSRA & _BV(ADSC));
+    while (ADCSRA & _BV(ADSC)) ;
     return ADC;
 }
 
 uint8_t checkIRQ(uint8_t opt_com){
-//	uint16_t adc_values[3] = {0};
+	uint16_t tmp;
 
-//	adc_values[0] = adc_read(ADC_2);  // Нога 25
-//	adc_values[1] = adc_read(ADC_3);  // Нога 26
-//	adc_values[2] = adc_read(ADC_4);  // Нога 27
+	PORT(ADC_PORT) |= _BV(ADC_4); // Включить подтяжку PC3
+	tmp = adc_read(ADC_4);
+	PORT(ADC_PORT) &= ~_BV(ADC_4); // Отключить подтяжку PC3
 
-	if (true) { // TODO: Определяем используется ли прерывание IRQX считывая напряжение на 26 ноге
-		if (opt_com == SELECT_COM1 || opt_com == SELECT_COM3) {
-			return USE_IRQ4;
-		}
-			return USE_IRQ3;
+	// Определяем используется ли прерывание IRQX (джампер опускает напряжение к 0)
+	if (tmp > IRQX_threshold) { // Напряжение на выводе IRQ выше заданного значения
+			if (opt_com == SELECT_COM1 || opt_com == SELECT_COM3) {
+					return USE_IRQ4;
+			}
+					return USE_IRQ3;
 	}
 
 	return USE_IRQX;
+}
+
+bool getIRQstate(uint8_t nIRQ){
+	return (PIN(ADC_PORT) & _BV(nIRQ));
 }
 
 int main(void) {
@@ -1011,7 +919,7 @@ int main(void) {
 
 	for(;;) {
 
-		if (send_PS2_data_flag) {
+		if (send_PS2_data_flag || !getIRQstate(opt_irq_settings)) {
 			sentToSpi();
 		}
 		
@@ -1022,11 +930,11 @@ int main(void) {
 		// изменились нажатые кнопки или положение мыши
         
 		// Отправляем данные через SPI
-		if (send_PS2_data_flag) {
+		if (send_PS2_data_flag || !getIRQstate(opt_irq_settings)) {
 			TCNT0 = TIMER0_CONST;
 			sentToSpi();
 		}
-		
+
 		// Регулирование скорости мыши прямо с мыши
 		if (rs232m_protocol == PROTOCOL_MICROSOFT && (ps2m_b & 3) == 3) {
 			if (ps2m_z < 0) { 

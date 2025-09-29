@@ -5,24 +5,24 @@ use IEEE.NUMERIC_STD.ALL;
 entity uart_isa is
     Port (
         -- ISA Bus Interface
-        isa_addr     : in  std_logic_vector(9 downto 0);
-        isa_data     : inout std_logic_vector(7 downto 0);
-        isa_iow      : in  std_logic;
-        isa_ior      : in  std_logic;
-        isa_aen      : in  std_logic;
-        isa_reset    : in  std_logic;
+        isa_addr     : in  std_logic_vector(9 downto 0);   -- pins 15, 14, 13, 12, 10, 8, 6, 5, 3, 2
+        isa_data     : inout std_logic_vector(7 downto 0); -- pins 31, 28, 27, 25, 23, 22, 21, 20
+        isa_iow      : in  std_logic; -- pin 37
+        isa_ior      : in  std_logic; -- pin 18
+        isa_aen      : in  std_logic; -- pin 19
+        isa_reset    : in  std_logic; -- pin 33
         
         -- MCU Interface
-        mcu_isa_res  : out std_logic := '0'; -- сброс MCU
-        mcu_txd      : out std_logic := '0'; -- Аналог SPI, данные в регистр передачи в MCU
-        mcu_rxd      : in  std_logic;        -- Аналог SPI, данные в регистр приема от MCU
-        mcu_clk      : in  std_logic;        -- Аналог SPI, такты от MCU
-        mcu_res      : in  std_logic;        -- Аналог SPI, синхронизация от MCU
+        mcu_isa_res  : out std_logic; -- pin 34, сброс MCU
+        mcu_DTR	     : out std_logic; -- pin 35, Признак включения мыши для MCU
+        mcu_rxd      : in  std_logic; -- pin 38, SPI, данные в регистр приема от MCU
+        mcu_clk      : in  std_logic; -- pin 40, SPI, такты от MCU
+        mcu_res      : in  std_logic; -- pin 39, SPI, синхронизация от MCU
 
         -- IRQ out
-        IRQ3         : out  std_logic := 'Z';
-        IRQ4         : out  std_logic := 'Z';
-        IRQX         : out  std_logic := 'Z'
+        IRQ3         : out  std_logic := 'Z'; -- pin 44
+        IRQ4         : out  std_logic := 'Z'; -- pin 42
+        IRQX         : out  std_logic := 'Z'  -- pin 43
 	  );
 end uart_isa;
 
@@ -42,6 +42,7 @@ architecture Behavioral of uart_isa is
     signal Enable_IRQ     : std_logic := '0'; -- разрешение использования IRQ
     signal RxD_IE         : std_logic := '0'; -- разрешение прерывания приема данных
     signal RxD_IRQ        : std_logic := '0'; -- прерывание приема данных
+    signal TxD_IE         : std_logic := '0'; -- разрешение прерывания передачи данных
 
     -- Сигналы адресного декодирования
     signal device_select  : std_logic;
@@ -79,7 +80,7 @@ begin
 							end if;
 						 when "001" => -- Регистр разрешения прерывания
 							if line_ctl_reg(7) = '0' then -- DLAB check
-								data_out <= "0000000" & not RxD_IRQ;
+								data_out <= "0000001" & not RxD_IRQ; -- Готовность передачи всегда включена
 							end if;
 						 when "010" => -- причина прерывания: xxxxx10x = принят символ; сбрасывается чтением приемника
 								data_out <= "00000" & RxD_IRQ & "00";
@@ -97,13 +98,16 @@ begin
 	process(isa_iow, isa_reset) begin -- Асинхронная запись в регистры UART
 		if isa_reset = '1' then -- Сброс ISA шины
 			RxD_IE <= '0'; -- Запрет прерывания приема данных
+			TxD_IE <= '0'; -- Запрет прерывания передачи данных
 		else
 			if rising_edge(isa_iow) then -- Запись в регистры UART
 				if (device_select = '1') then
 					case isa_addr(2 downto 0) is
 						when "001" =>
 							if line_ctl_reg(7) = '0' then -- DLAB check
-								RxD_IE <= isa_data(0); -- Регистр разрешения прерываний
+								 -- Регистр разрешения прерываний
+								RxD_IE <= isa_data(0);
+								TxD_IE <= isa_data(1);
 							end if;
 						when "011" => line_ctl_reg <= isa_data;
 						when "100" => mdm_ctl_reg <= isa_data;
@@ -161,11 +165,10 @@ begin
 
 	-- Комбинаторная логика
 	mcu_isa_res	<= not isa_reset; -- Передача сигнала сброса ISA шины на MCU
-
-	mcu_txd <= mdm_ctl_reg(to_integer(bit_counter)); -- Последовательный сигнал передачи данных в MCU
+	mcu_DTR <= mdm_ctl_reg(0);    -- Управление питанием мыши
 
 	device_select <= '1' when 	isa_aen = '1' and base_addr_rdy = '1' and 
-										isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val))) else '0';
+									isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val))) else '0';
 
 	isa_data				<= data_out when isa_reset = '0' and device_select = '1' and
 												  isa_ior = '0' and isa_iow = '1' else (others => 'Z');

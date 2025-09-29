@@ -24,8 +24,10 @@
 //===========================================================================
 // pin definitions
 //===========================================================================
-#define SPI_MISO_PORT	D
-#define SPI_MISO_PIN	0    		// PD0 - нога 30
+//#define SPI_MISO_PORT	D			// TODO: переделать на выход MCU_reset
+//#define SPI_MISO_PIN	0    		// PD0 - нога 30
+#define SPI_RESOUT_PORT	D
+#define SPI_RESOUT_PIN	0    		// PD0 - нога 30
 #define SPI_MOSI_PORT 	D
 #define SPI_MOSI_PIN	1    		// PD1 - нога 31
 #define DTR_PORT		D
@@ -64,9 +66,16 @@
 //===========================================================================
 #define ADC_PORT       C
 #define ADC_2  2			// PC2 - нога 25 IRQ4
-#define ADC_3  3			// PC3 - нога 26 IRQ3
-#define ADC_4  4			// PC4 - нога 27 IRQX
+#define ADC_3  3			// PC3 - нога 26 IRQX
+#define ADC_4  4			// PC4 - нога 27 IRQ3
+
+//===========================================================================
+// IRQ
+//===========================================================================
 #define IRQX_threshold 512
+#define get_IRQ4_state() (PIN(ADC_PORT) & _BV(ADC_2))
+#define get_IRQX_state() (PIN(ADC_PORT) & _BV(ADC_3))
+#define get_IRQ3_state() (PIN(ADC_PORT) & _BV(ADC_4))
 
 //===========================================================================
 // Светодиод
@@ -81,6 +90,8 @@
 #define spi_mosi_low()     PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN)
 #define spi_sck_high()     PORT(SPI_SCK_PORT) |= _BV(SPI_SCK_PIN)
 #define spi_sck_low()      PORT(SPI_SCK_PORT) &= ~_BV(SPI_SCK_PIN)
+#define spi_reset_high()   PORT(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN)
+#define spi_reset_low()    PORT(SPI_RESOUT_PORT) &= ~_BV(SPI_RESOUT_PIN)
 
 //===========================================================================
 // Select UART base address
@@ -472,6 +483,7 @@ void spi_init(void) {
     // Установка начальных состояний
     spi_sck_low();    // SCK низкий
     spi_mosi_low();   // MOSI низкий
+    spi_reset_low();  // Reset низкий
 
     spi_enabled = get_mouse_power_state();
     if (spi_enabled) {
@@ -481,8 +493,8 @@ void spi_init(void) {
 
 //---------------------------------------------------------------------------
 // Отправка/приём байта по SPI
-uint8_t spi_transfer(uint8_t data) {
-    uint8_t received = 0;
+void spi_transfer(uint8_t data) {
+//    uint8_t received = 0;
     
     for(uint8_t i = 0; i < 8; i++) {
         // Установка бита на MOSI
@@ -498,16 +510,16 @@ uint8_t spi_transfer(uint8_t data) {
         spi_sck_high();
         
         // Чтение MISO
-        received <<= 1;
-        if(PIN(SPI_MISO_PORT) & _BV(SPI_MISO_PIN)) {
-            received |= 0x01;
-        }
+//        received <<= 1;
+//        if(PIN(SPI_MISO_PORT) & _BV(SPI_MISO_PIN)) {
+//            received |= 0x01;
+//        }
         
         _delay_us(5);
         spi_sck_low();
     }
-    
-    return received;
+
+//    return received;
 }
 
 // Отправка конфигурации через SPI
@@ -757,13 +769,13 @@ static void init(void) {
 	DDR(LED_PORT)  |= _BV(LED_PIN);  // pin 24 (PC1) как выход (LED)
 	PORT(LED_PORT) |= _BV(LED_PIN);  // PC1 = 1, LED OFF
 
-	DDR(ADC_PORT) &= ~_BV(ADC_2);  // pin 25 (PC2) вход
-	PORT(ADC_PORT) &= ~_BV(ADC_2);  // Отключить подтяжку PC2
+	DDR(ADC_PORT) &= ~_BV(ADC_2);  // pin 25 (PC2) вход IRQ3
+	PORT(ADC_PORT) &= ~_BV(ADC_2); // Отключить подтяжку PC2
 
-	DDR(ADC_PORT) &= ~_BV(ADC_3);  // pin 26 (PC3) как вход
+	DDR(ADC_PORT) &= ~_BV(ADC_3);  // pin 26 (PC3) вход IRQX
 	PORT(ADC_PORT) &= ~_BV(ADC_3); // Отключить подтяжку PC3
 
-	DDR(ADC_PORT) &= ~_BV(ADC_4);  // pin 27 (PC4) как вход
+	DDR(ADC_PORT) &= ~_BV(ADC_4);  // pin 27 (PC4) вход IRQ4
 	PORT(ADC_PORT) &= ~_BV(ADC_4); // Отключить подтяжку PC4
 
 	DDR(SPI_SCK_PORT) |= _BV(SPI_SCK_PIN);  // pin 28 (PC5) как выход soft SPI CLC
@@ -774,13 +786,13 @@ static void init(void) {
 
 //---------------------------------------------------------------------------
 // Port D
-	DDR(SPI_MISO_PORT) &= ~_BV(SPI_MISO_PIN);  // pin 30 (PD0) вход soft SPI MISO
-	PORT(SPI_MISO_PORT) |= _BV(SPI_MISO_PIN); // Подтяжка на PD0
+	DDR(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN);   // pin 30 (PD0) выход soft SPI reset
+	PORT(SPI_RESOUT_PORT) &= ~_BV(SPI_RESOUT_PIN); // PD0 = 0
 
-	DDR(SPI_MOSI_PORT) |= _BV(SPI_MOSI_PIN);  // pin 31 (PD1) выход soft SPI MOSI
-	PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN);  // PD1 = 0
+	DDR(SPI_MOSI_PORT) |= _BV(SPI_MOSI_PIN);   // pin 31 (PD1) выход soft SPI MOSI
+	PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN); // PD1 = 0
 
-	DDR(DTR_PORT) &= ~_BV(DTR_PIN);  // pin 32 (PD2) вход DTR|RTS
+	DDR(DTR_PORT) &= ~_BV(DTR_PIN); // pin 32 (PD2) вход DTR|RTS
 	PORT(DTR_PORT) |= _BV(DTR_PIN); // Подтяжка на PD2
 
 	DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);  // pin 1 (PD3) вход (Mouse clock)
@@ -879,9 +891,9 @@ uint16_t adc_read(uint8_t channel) {
 uint8_t checkIRQ(uint8_t opt_com){
 	uint16_t tmp;
 
-	PORT(ADC_PORT) |= _BV(ADC_4); // Включить подтяжку PC3
-	tmp = adc_read(ADC_4);
-	PORT(ADC_PORT) &= ~_BV(ADC_4); // Отключить подтяжку PC3
+	PORT(ADC_PORT) |= _BV(ADC_3); // Включить подтяжку PC3
+	tmp = adc_read(ADC_3);
+	PORT(ADC_PORT) &= ~_BV(ADC_3); // Отключить подтяжку PC3
 
 	// Определяем используется ли прерывание IRQX (джампер опускает напряжение к 0)
 	if (tmp > IRQX_threshold) { // Напряжение на выводе IRQ выше заданного значения

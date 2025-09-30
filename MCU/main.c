@@ -167,8 +167,25 @@ uint8_t spi_tx_buf[SPI_TX_BUFFER_SIZE];
 volatile uint8_t spi_tx_buf_w;
 volatile uint8_t spi_tx_buf_r;
 volatile uint8_t spi_tx_buf_count;
-volatile bool spi_reset = true; // Необходима инициализация интерфейса soft spi
-volatile bool spi_enabled = false;
+volatile uint8_t spi_bitcount;
+volatile uint8_t spi_busy;
+volatile bool spi_reset; // Необходима инициализация интерфейса soft spi
+volatile bool spi_enabled;
+
+#define PROTOCOL_MICROSOFT		0
+#define PROTOCOL_EM84520		1
+
+uint8_t mouse_protocol = PROTOCOL_MICROSOFT; // Используемый протокол: 0=MSMouse, 1=EM84520
+
+const uint8_t EM84520_ID[61] = {
+    0x4D, 0x5A, 0x40, 0x00, 0x00, 0x00, 0x08, 0x01, 0x24, 0x25, 0x2D, 0x23,
+    0x10, 0x10, 0x10, 0x11, 0x3C, 0x3C, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x3C,
+    0x30, 0x2E, 0x30, 0x10, 0x26, 0x10, 0x21, 0x3C, 0x25, 0x2D, 0x23, 0x00,
+    0x33, 0x23, 0x32, 0x2F, 0x2C, 0x2C, 0x29, 0x2E, 0x27, 0x00, 0x33, 0x25,
+    0x32, 0x29, 0x21, 0x2C, 0x00, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x21, 0x15,
+    0x09
+};
+
 
 //---------------------------------------------------------------------------
 // Чтение джамперов
@@ -218,6 +235,7 @@ uint8_t readRatesettings(void) {
 	   	return DATA_RATE_50;
 	return DATA_RATE_100;
 }
+
 //---------------------------------------------------------------------------
 // Сохранить принятый байт в буфер приёма PS/2 порта. Вызывается только из обработчика прерывания.
 void ps2_rx_push(uint8_t c) {
@@ -410,62 +428,6 @@ void ps2_send(uint8_t c) {
     }
 }
 
-#if 0
-//===========================================================================
-// RS232 порт
-//===========================================================================
-
-//#define RS232_TX_BUFFER_SIZE 512
-#define RS232_TX_BUFFER_SIZE 256
-
-uint8_t rs232_tx_buf[RS232_TX_BUFFER_SIZE];
-volatile uint8_t rs232_tx_buf_w;
-volatile uint8_t rs232_tx_buf_r;
-volatile uint8_t rs232_tx_buf_count;
-volatile bool rs232_reset;
-volatile bool rs232_enabled;
-
-void rs232_send(uint8_t c) {
-    // Ожидание, если буфер переполнен
-    while (rs232_tx_buf_count == sizeof(rs232_tx_buf));
-
-    // Выключаем прерывания, так как обработчик прерывания тоже модифицирует эти переменные
-    cli();
-
-    // Если передача уже идёт или в буфере передачи что-то есть, то сохраняем в буфер значение
-    if (rs232_tx_buf_count || ((UCSRA & _BV(UDRE)) == 0)) {
-        rs232_tx_buf[rs232_tx_buf_w] = c;
-        if (++rs232_tx_buf_w == sizeof(rs232_tx_buf)) {
-            rs232_tx_buf_w = 0;
-        }
-        rs232_tx_buf_count++;
-    } else {
-        // Иначе выводим значение в порт
-        UDR = c;
-    }
-
-    // Включаем прерывания
-    sei();
-}
-
-//---------------------------------------------------------------------------
-// COM-порт отправил байт
-ISR (USART_TXC_vect) {
-	// Если буфер пуст, то ничего не делаем
-	if (!rs232_tx_buf_count) {
-		return;
-	}
-
-	// Иначе отправляем байт из буфера
-	UDR = rs232_tx_buf[rs232_tx_buf_r];
-	rs232_tx_buf_count--;
-	if (++rs232_tx_buf_r == sizeof(rs232_tx_buf)) {
-		rs232_tx_buf_r = 0;
-	}
-}
-
-//---------------------------------------------------------------------------
-#endif
 // Изменилось состояние линий DTR или RTS
 ISR (INT0_vect) {
 	// Сохраняем состояние в переменную
@@ -481,7 +443,13 @@ ISR (INT0_vect) {
 // Инициализация Soft SPI
 void spi_init(void) {
     // Установка начальных состояний
-    spi_sck_low();    // SCK низкий
+	spi_tx_buf_w = 0;
+	spi_tx_buf_r = 0;
+	spi_tx_buf_count = 0;
+	spi_bitcount = 0;
+	spi_busy = 0;
+
+	spi_sck_low();    // SCK низкий
     spi_mosi_low();   // MOSI низкий
     spi_reset_low();  // Reset низкий
 
@@ -492,56 +460,101 @@ void spi_init(void) {
 }
 
 //---------------------------------------------------------------------------
-// Отправка/приём байта по SPI
-void spi_transfer(uint8_t data) {
-//    uint8_t received = 0;
-    
-    for(uint8_t i = 0; i < 8; i++) {
-        // Установка бита на MOSI
-        if(data & 0x80) {
-            spi_mosi_high();
-        } else {
-            spi_mosi_low();
-        }
-        data <<= 1;
-        
-        // Тактовый импульс
-        _delay_us(5);
-        spi_sck_high();
-        
-        // Чтение MISO
-//        received <<= 1;
-//        if(PIN(SPI_MISO_PORT) & _BV(SPI_MISO_PIN)) {
-//            received |= 0x01;
-//        }
-        
-        _delay_us(5);
-        spi_sck_low();
-    }
+// Проверка готовности порта для приёма
+bool ready2receive(void){
+	if (opt_irq_settings == USE_IRQ4) {
+		return get_IRQ4_state();
+	}
+	if (opt_irq_settings == USE_IRQ3) {
+		return get_IRQ3_state();
+	}
+	if (opt_irq_settings == USE_IRQX) {
+		return get_IRQX_state();
+	}
 
-//    return received;
+	return true;
 }
 
-// Отправка конфигурации через SPI
+//---------------------------------------------------------------------------
+// Отправка данных через SPI
+void spi_send(uint8_t c) {
+	while (spi_tx_buf_count == SPI_TX_BUFFER_SIZE) ; // Ждём, если буфер передачи полон
+
+	cli(); // не допускаем конфликтов, эти переменные могут изменяться в прерывании
+	spi_tx_buf[spi_tx_buf_w] = c; // добавляем значение в буфер
+	if (spi_tx_buf_count++ == 0) { // инкрементируем счётчик заполнения буфера
+		if (!spi_busy) { // если spi бездействует, запускаем передачу
+			TCNT1 = 0;
+			TCCR1B |= (1 << CS10); // Период такта таймера = 125 нс
+		}
+	}
+	sei();
+	if (++spi_tx_buf_w == SPI_TX_BUFFER_SIZE) {
+		spi_tx_buf_w = 0;
+	}
+}
+
+// Обработчик прерывания таймера
+ISR(TIMER1_COMPA_vect) {
+	static uint8_t current_byte = 0;
+
+	switch (spi_bitcount){
+		case 0: if (ready2receive()) {
+					spi_busy = 1;
+					current_byte = spi_tx_buf[spi_tx_buf_r];
+					if (++spi_tx_buf_r == (SPI_TX_BUFFER_SIZE)) {
+						spi_tx_buf_r = 0;
+					}
+					spi_tx_buf_count++;
+					spi_bitcount++;
+				}
+		case 2:
+		case 4:
+		case 6:
+		case 8:
+		case 10:
+		case 12:
+		case 14:
+				spi_sck_low();
+				if (current_byte & (1 << ((spi_bitcount << 1) - 1)))
+					spi_mosi_high();
+				else 
+					spi_mosi_low();
+				spi_bitcount++;
+				break;
+
+		case 1:
+		case 3:
+		case 5:
+		case 7:
+		case 9:
+		case 11:
+		case 13:
+				spi_sck_high();
+				spi_bitcount++;
+				break;
+		case 15:
+				spi_sck_high();
+				spi_bitcount = 0;
+				if (!spi_tx_buf_count) { // Буфер пуст, остановить таймер
+					TCCR1B &= ~(1 << CS10);
+					spi_busy = 0;
+				}
+				break;
+
+		default:
+				spi_bitcount = 0;
+	}
+}
+
+// Отправка конфигурации устройства через SPI
 void spi_send_config(uint8_t opt_com, uint8_t opt_irq) {
 	uint8_t config_data = 0;
 	config_data &= ~(opt_com & 0x03);
 	config_data |= (opt_com & 0x03);
 	config_data &= ~((opt_irq & 0x03) << 2);
 	config_data |= ((opt_irq & 0x03) << 2);
-
-	spi_transfer(config_data);
-}
-
-//---------------------------------------------------------------------------
-// Отправка пакета данных мыши через SPI
-void spi_send_mouse_data(int8_t x, int8_t y, int8_t z, uint8_t buttons) {
-    // Отправка синхробайта и данных мыши
-    spi_transfer(0xAA);  // Синхробайт
-    spi_transfer(buttons);
-    spi_transfer((uint8_t)x);
-    spi_transfer((uint8_t)y);
-    spi_transfer((uint8_t)z);
+	spi_send(config_data);
 }
 
 //===========================================================================
@@ -564,9 +577,9 @@ ISR (TIMER2_OVF_vect) {
 //===========================================================================
 // PS/2 мышь
 //===========================================================================
+
 //---------------------------------------------------------------------------
 // Инициализация PS/2 мыши
-
 static void ps2m_init() {
 	// Посылаем команду "Сброс"
 	ps2_send(0xFF);
@@ -632,69 +645,26 @@ ISR (TIMER0_OVF_vect) { // 80.13 Hz
 //===========================================================================
 // Интерфейс с компьютером
 //===========================================================================
-
-#define PROTOCOL_MICROSOFT		0
-#define PROTOCOL_EM84520		1
-
-uint8_t rs232m_protocol; // Используемый протокол: 0=MSMouse, 1=EM84520
-
-const uint8_t EM84520_ID[61] = {
-    0x4D, 0x5A, 0x40, 0x00, 0x00, 0x00, 0x08, 0x01, 0x24, 0x25, 0x2D, 0x23,
-    0x10, 0x10, 0x10, 0x11, 0x3C, 0x3C, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x3C,
-    0x30, 0x2E, 0x30, 0x10, 0x26, 0x10, 0x21, 0x3C, 0x25, 0x2D, 0x23, 0x00,
-    0x33, 0x23, 0x32, 0x2F, 0x2C, 0x2C, 0x29, 0x2E, 0x27, 0x00, 0x33, 0x25,
-    0x32, 0x29, 0x21, 0x2C, 0x00, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x21, 0x15,
-    0x09
-};
-
-#if 0
 //---------------------------------------------------------------------------
-
-static void rs232m_init() {
-    // Протокол определяется перемычкой на плате
-    rs232m_protocol = get_jumper() ? PROTOCOL_MICROSOFT : PROTOCOL_EM84520;
-
-    // Настройка RS232: 1200 бод, 1 стоп бит, 7 бит, нет чётности
-    UCSRA = 0;
-    UCSRB = _BV(TXEN) | _BV(RXEN) | _BV(TXCIE);
-	 // В режиме MS регистр USBS = 0 (1 стоп-бит), в режиме EM84520 - 2 стоп-бита
-    UCSRC = rs232m_protocol == PROTOCOL_EM84520 ? (_BV(URSEL)|_BV(USBS)|_BV(UCSZ1)) : (_BV(URSEL)|_BV(UCSZ1));
-    
-    UBRRH = 0x03;	//0x02;
-    UBRRL = 0x40;	//0xFF;
-    
-    // По умолчанию включён
-    //rs232_enabled = true;
-
-    // Вывести приветствие
-    //rs232_reset = true;    
-	 
-    rs232_enabled = !get_com_power();
-    if (rs232_enabled) {
-        rs232_reset = true; 
-    }
-}
-
-//---------------------------------------------------------------------------
-
-void rs232m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
+// Отправка данных мыши через SPI
+void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
     uint8_t lb, rb, mb;
     static uint8_t mb1;
     
     // Обработка сброса      
-    if (rs232_reset) {
-        rs232_reset = false; 
+    if (spi_reset) {
+        spi_reset = false; 
         _delay_ms(14);
-        if (rs232m_protocol == PROTOCOL_EM84520) {
+        if (mouse_protocol == PROTOCOL_EM84520) {
             // Приветствие EM84520
             for (uint8_t i = 0; i < sizeof(EM84520_ID); i++) {
-                rs232_send(EM84520_ID[i]);
+                spi_send(EM84520_ID[i]);
             }
         } else {
             // Приветствие Logitech/Microsoft Plus
-            rs232_send(0x4D);
+            spi_send(0x4D);
             _delay_ms(63);
-            rs232_send(0x33);
+            spi_send(0x33);
         }
     }
     
@@ -704,29 +674,20 @@ void rs232m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
     mb = (b >> 2) & 1;
 
     // Стандартная часть протокола 
-    rs232_send((1 << 6) | (lb << 5) | (rb << 4) | ((y & 0xC0) >> 4) | ((x & 0xC0) >> 6));
-    rs232_send(x & 0x3F);
-    rs232_send(y & 0x3F);
+    spi_send((1 << 6) | (lb << 5) | (rb << 4) | ((y & 0xC0) >> 4) | ((x & 0xC0) >> 6));
+    spi_send(x & 0x3F);
+    spi_send(y & 0x3F);
     
-    if (rs232m_protocol == PROTOCOL_EM84520) {
+    if (mouse_protocol == PROTOCOL_EM84520) {
         // Расширение EM84520
-        rs232_send((mb << 4) | (z & 0x0F));
+        spi_send((mb << 4) | (z & 0x0F));
     } else { 
         // Расширение Logitech/Microsoft Plus
         if (mb || mb1) {
-            rs232_send(mb << 5);
+            spi_send(mb << 5);
             mb1 = mb;
         }
-    }                    
-}
-
-#endif
-
-//---------------------------------------------------------------------------
-// Отправка данных мыши через SPI
-void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
-    // Отправка данных через SPI
-    spi_send_mouse_data(x, y, z, b);
+    }       
 }
 
 //===========================================================================
@@ -810,13 +771,25 @@ static void init(void) {
 	DDR(DUTY_SEL2_PORT) &= ~_BV(DUTY_SEL2_PIN);  // pin 11 (PD7) вход duty 50%
 	PORT(DUTY_SEL2_PORT) |= _BV(DUTY_SEL2_PIN);  // Подтяжка на PD7
 
-	// Timer/Counter 0 initialization
+	// Timer 0
 	// Clock source: System Clock (8 MHZ)
 	// Частота на выходе таймера ~ 80.13Hz
 	TCCR0 = _BV(CS02) | _BV(CS00);	// CLK/1024
 	TCNT0 = TIMER0_CONST; //0x9F
 
+	// Таймер 1
+	// Clock source: System Clock (8 MHZ)
+	// Режим: CTC (Clear Timer on Compare Match) с OCR1A
+	TCCR1A = 0;  // Normal port operation
+	TCCR1B = (1 << WGM12);  // CTC mode
+    
+	// Расчет значения для сравнения (2mks)
+	// Необходимое количество тактов = Время / Период_такта
+	// 2mks / 125ns = 2000mks / 125ns = 16 тактов
+	OCR1A = 15;  // 0-15 = 16 тактов
+
 	// Таймер 2
+	// Clock source: System Clock (8 MHZ)
 	ASSR = 0; 
 	TCCR2 = _BV(CS22)|_BV(CS21)|_BV(CS20);	// CLK/1024
 	TCNT2 = 0x7F;
@@ -828,10 +801,8 @@ static void init(void) {
 	GIFR = _BV(INTF0);     // Очистить флаг прерывания (если был установлен раньше)
 
 	// Timer(s)/Counter(s) Interrupt(s) initialization
-	TIMSK = 0; 
-    
 	// Включаем прерывания от таймеров 0 и 2
-	TIMSK |= _BV(TOIE0)|_BV(TOIE2);
+	TIMSK = _BV(TOIE0)|_BV(OCIE1A)|_BV(TOIE2);
 
 	// Analog Comparator initialization
 	// Analog Comparator: Off
@@ -844,7 +815,7 @@ static void init(void) {
 	ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS0);  // Включить ADC, делитель 32
 
 	// Настройка Watchdog-таймера
-	//wdt_enable(WDTO_1S);
+	wdt_enable(WDTO_1S);
 
 	// Включение прерываний
 	sei();
@@ -906,10 +877,6 @@ uint8_t checkIRQ(uint8_t opt_com){
 	return USE_IRQX;
 }
 
-bool getIRQstate(uint8_t nIRQ){
-	return (PIN(ADC_PORT) & _BV(nIRQ));
-}
-
 int main(void) {
 	// Восстанавливаем настройки	 
 	ps2m_multiplier = eeprom_read_byte(EEPROM_OFFSET_MULTIPLIER);
@@ -931,7 +898,7 @@ int main(void) {
 
 	for(;;) {
 
-		if (send_PS2_data_flag || !getIRQstate(opt_irq_settings)) {
+		if (send_PS2_data_flag) {
 			sentToSpi();
 		}
 		
@@ -942,13 +909,13 @@ int main(void) {
 		// изменились нажатые кнопки или положение мыши
         
 		// Отправляем данные через SPI
-		if (send_PS2_data_flag || !getIRQstate(opt_irq_settings)) {
+		if (send_PS2_data_flag) {
 			TCNT0 = TIMER0_CONST;
 			sentToSpi();
 		}
 
 		// Регулирование скорости мыши прямо с мыши
-		if (rs232m_protocol == PROTOCOL_MICROSOFT && (ps2m_b & 3) == 3) {
+		if (mouse_protocol == PROTOCOL_MICROSOFT && (ps2m_b & 3) == 3) {
 			if (ps2m_z < 0) { 
 				if (ps2m_multiplier > 0) {
 					ps2m_multiplier--; 

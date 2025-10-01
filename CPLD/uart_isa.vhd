@@ -34,7 +34,7 @@ architecture Behavioral of uart_isa is
 
     -- Регистры накопления данных UART
     signal rx_acc_reg     : std_logic_vector(7 downto 0) := (others => '0');	-- Аккумулятор бит от MCU
-	 signal bit_counter	  : unsigned(2 downto 0) := (others => '0');			   -- Счётчик бит от MCU
+    signal bit_counter	  : unsigned(2 downto 0) := (others => '0');			   -- Счётчик бит от MCU
 
     -- Сигналы управления IRQ
     signal SET_RxD_IRQ    : std_logic := '0'; -- сигнал запроса установки RxD_IRQ

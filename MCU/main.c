@@ -65,17 +65,17 @@
 // ADC каналы
 //===========================================================================
 #define ADC_PORT       C
-#define ADC_2  2			// PC2 - нога 25 IRQ4
-#define ADC_3  3			// PC3 - нога 26 IRQX
-#define ADC_4  4			// PC4 - нога 27 IRQ3
+#define IRQ3_PIN  2			// PC2 - нога 25 IRQ3
+#define IRQX_PIN  3			// PC3 - нога 26 IRQX
+#define IRQ4_PIN  4			// PC4 - нога 27 IRQ4
 
 //===========================================================================
 // IRQ
 //===========================================================================
 #define IRQX_threshold 512
-#define get_IRQ4_state() (PIN(ADC_PORT) & _BV(ADC_2))
-#define get_IRQX_state() (PIN(ADC_PORT) & _BV(ADC_3))
-#define get_IRQ3_state() (PIN(ADC_PORT) & _BV(ADC_4))
+#define get_IRQ4_state() (PIN(ADC_PORT) & _BV(IRQ4_PIN))
+#define get_IRQX_state() (PIN(ADC_PORT) & _BV(IRQX_PIN))
+#define get_IRQ3_state() (PIN(ADC_PORT) & _BV(IRQ3_PIN))
 
 //===========================================================================
 // Светодиод
@@ -92,6 +92,10 @@
 #define spi_sck_low()      PORT(SPI_SCK_PORT) &= ~_BV(SPI_SCK_PIN)
 #define spi_reset_high()   PORT(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN)
 #define spi_reset_low()    PORT(SPI_RESOUT_PORT) &= ~_BV(SPI_RESOUT_PIN)
+
+#define spi_timer_stop()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0;}
+#define spi_timer_fast()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS10);}
+#define spi_timer_slow()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS12) | (1 << CS10);}
 
 //===========================================================================
 // Select UART base address
@@ -167,7 +171,7 @@ uint8_t spi_tx_buf[SPI_TX_BUFFER_SIZE];
 volatile uint8_t spi_tx_buf_w;
 volatile uint8_t spi_tx_buf_r;
 volatile uint8_t spi_tx_buf_count;
-volatile uint8_t spi_bitcount;
+volatile uint8_t spi_state_machine;
 volatile uint8_t spi_busy;
 volatile bool spi_reset; // Необходима инициализация интерфейса soft spi
 volatile bool spi_enabled;
@@ -178,25 +182,24 @@ volatile bool spi_enabled;
 uint8_t mouse_protocol = PROTOCOL_MICROSOFT; // Используемый протокол: 0=MSMouse, 1=EM84520
 
 const uint8_t EM84520_ID[61] = {
-    0x4D, 0x5A, 0x40, 0x00, 0x00, 0x00, 0x08, 0x01, 0x24, 0x25, 0x2D, 0x23,
-    0x10, 0x10, 0x10, 0x11, 0x3C, 0x3C, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x3C,
-    0x30, 0x2E, 0x30, 0x10, 0x26, 0x10, 0x21, 0x3C, 0x25, 0x2D, 0x23, 0x00,
-    0x33, 0x23, 0x32, 0x2F, 0x2C, 0x2C, 0x29, 0x2E, 0x27, 0x00, 0x33, 0x25,
-    0x32, 0x29, 0x21, 0x2C, 0x00, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x21, 0x15,
-    0x09
+	0x4D, 0x5A, 0x40, 0x00, 0x00, 0x00, 0x08, 0x01, 0x24, 0x25, 0x2D, 0x23,
+	0x10, 0x10, 0x10, 0x11, 0x3C, 0x3C, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x3C,
+	0x30, 0x2E, 0x30, 0x10, 0x26, 0x10, 0x21, 0x3C, 0x25, 0x2D, 0x23, 0x00,
+	0x33, 0x23, 0x32, 0x2F, 0x2C, 0x2C, 0x29, 0x2E, 0x27, 0x00, 0x33, 0x25,
+	0x32, 0x29, 0x21, 0x2C, 0x00, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x21, 0x15,
+	0x09
 };
-
 
 //---------------------------------------------------------------------------
 // Чтение джамперов
 uint8_t readCOMsettings(void) {
 	bool t = false;
 	if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 0) &&
-	   ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 1))
-	   	return SELECT_COM2;
+		((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 1))
+			return SELECT_COM2;
 	if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 1) &&
-	   ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0))
-	   	return SELECT_COM4;
+		((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0))
+			return SELECT_COM4;
 
 	// Перемычки на землю не обнаружены, проверяем перемычу между джамперами
 	DDR(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);	// COM_SEL1 теперь выход
@@ -218,21 +221,21 @@ bool readWheelsettings(void) {
 
 uint8_t readDutysettings(void) {
 	if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 0) &&
-	   ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 1))
-	   	return DUTY_50;
+		((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 1))
+			return DUTY_50;
 	if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 1) &&
-	   ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 0))
-	   	return DUTY_75;
+		((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 0))
+			return DUTY_75;
 	return DUTY_100;
 }
 
 uint8_t readRatesettings(void) {
 	if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 0) &&
-	   ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 1))
-	   	return DATA_RATE_25;
+		((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 1))
+			return DATA_RATE_25;
 	if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 1) &&
-	   ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 0))
-	   	return DATA_RATE_50;
+		((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 0))
+			return DATA_RATE_50;
 	return DATA_RATE_100;
 }
 
@@ -269,10 +272,10 @@ uint8_t ps2_read(void) {
 		if (++ps2_rx_buf_r == sizeof(ps2_rx_buf)) {
 			ps2_rx_buf_r = 0;
 		}
-    }
-    
-    sei();	// Включаем прерывания
-    return d;
+	}
+
+	sei();	// Включаем прерывания
+	return d;
 }
 
 //---------------------------------------------------------------------------
@@ -358,12 +361,12 @@ void ps2_init(void) {
 	// Переключаем PS/2 порт на приём
 	DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
 	DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
-    
+
 	// Очищаем приёмный буфер
 	ps2_rx_buf_w = 0;
 	ps2_rx_buf_r = 0;
 	ps2_rx_buf_count = 0;
-    
+
 	// Устанавливаем переменные обработчика прерывания
 	ps2_state = ps2_state_read;
 	ps2_bitcount = 11;
@@ -377,55 +380,55 @@ void ps2_init(void) {
 //---------------------------------------------------------------------------
 // Отправка байта в PS/2 порт без подтверждения
 void ps2_write(uint8_t a) {
-    // Отключаем прерывание по изменению тактового сигнала PS/2
-    GIFR = _BV(INTF1);
-    GICR &= ~_BV(INT1);
+	// Отключаем прерывание по изменению тактового сигнала PS/2
+	GIFR = _BV(INTF1);
+	GICR &= ~_BV(INT1);
 
-    // Замыкаем тактовый сигнал PS/2 на землю
-    PORT(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
-    DDR(PS2_CLK_PORT) |= _BV(PS2_CLK_PIN);
+	// Замыкаем тактовый сигнал PS/2 на землю
+	PORT(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
+	DDR(PS2_CLK_PORT) |= _BV(PS2_CLK_PIN);
 
-    // ждём в течение 100 мкс
-    _delay_us(100);
+	// ждём в течение 100 мкс
+	_delay_us(100);
 
-    // Замыкаем линию данных PS/2 на землю
-    PORT(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
-    DDR(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN);
+	// Замыкаем линию данных PS/2 на землю
+	PORT(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
+	DDR(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN);
 
-    // Освобождаем тактовый сигнал
-    DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
+	// Освобождаем тактовый сигнал
+	DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
 
-    // Очищаем приёмный буфер
-    ps2_rx_buf_count = 0;
-    ps2_rx_buf_w = 0;
-    ps2_rx_buf_r = 0;
+	// Очищаем приёмный буфер
+	ps2_rx_buf_count = 0;
+	ps2_rx_buf_w = 0;
+	ps2_rx_buf_r = 0;
 
-    // Настраиваем переменные обработчика прерывания
-    ps2_state = ps2_state_write;
-    ps2_bitcount = 11;
-    ps2_data = a;             
-    ps2_parity = parity(a);
+	// Настраиваем переменные обработчика прерывания
+	ps2_state = ps2_state_write;
+	ps2_bitcount = 11;
+	ps2_data = a;             
+	ps2_parity = parity(a);
 
-    // Включаем прерывание по срезу тактового сигнала PS/2
-    GIFR = _BV(INTF1);
-    GICR |= _BV(INT1);
-    MCUCR = (MCUCR & 0xFC) | 2;    
+	// Включаем прерывание по срезу тактового сигнала PS/2
+	GIFR = _BV(INTF1);
+	GICR |= _BV(INT1);
+	MCUCR = (MCUCR & 0xFC) | 2;    
 }
 
 //---------------------------------------------------------------------------
 // Получение байта из PS/2 порта с ожиданием
 uint8_t ps2_recv(void) {
-    while (ps2_rx_buf_count == 0);
-    return ps2_read();
+	while (ps2_rx_buf_count == 0);
+	return ps2_read();
 }
 
 //---------------------------------------------------------------------------
 // Отправка байта в PS/2 порт с подтверждением
 void ps2_send(uint8_t c) {
-    ps2_write(c);
-    if (ps2_recv() != 0xFA) {
-        ps2_state = ps2_state_error;
-    }
+	ps2_write(c);
+	if (ps2_recv() != 0xFA) {
+		ps2_state = ps2_state_error;
+	}
 }
 
 // Изменилось состояние линий DTR или RTS
@@ -442,34 +445,34 @@ ISR (INT0_vect) {
 //===========================================================================
 // Инициализация Soft SPI
 void spi_init(void) {
-    // Установка начальных состояний
+	// Установка начальных состояний
 	spi_tx_buf_w = 0;
 	spi_tx_buf_r = 0;
 	spi_tx_buf_count = 0;
-	spi_bitcount = 0;
+	spi_state_machine = 0;
 	spi_busy = 0;
 
 	spi_sck_low();    // SCK низкий
-    spi_mosi_low();   // MOSI низкий
-    spi_reset_low();  // Reset низкий
+	spi_mosi_low();   // MOSI низкий
+	spi_reset_low();  // Reset низкий
 
-    spi_enabled = get_mouse_power_state();
-    if (spi_enabled) {
-        spi_reset = true;
-    }
+	spi_enabled = get_mouse_power_state();
+	if (spi_enabled) {
+		spi_reset = true;
+	}
 }
 
 //---------------------------------------------------------------------------
 // Проверка готовности порта для приёма
 bool ready2receive(void){
 	if (opt_irq_settings == USE_IRQ4) {
-		return get_IRQ4_state();
+		return !get_IRQ4_state();
 	}
 	if (opt_irq_settings == USE_IRQ3) {
-		return get_IRQ3_state();
+		return !get_IRQ3_state();
 	}
 	if (opt_irq_settings == USE_IRQX) {
-		return get_IRQX_state();
+		return !get_IRQX_state();
 	}
 
 	return true;
@@ -481,12 +484,10 @@ void spi_send(uint8_t c) {
 	while (spi_tx_buf_count == SPI_TX_BUFFER_SIZE) ; // Ждём, если буфер передачи полон
 
 	cli(); // не допускаем конфликтов, эти переменные могут изменяться в прерывании
-	spi_tx_buf[spi_tx_buf_w] = c; // добавляем значение в буфер
-	if (spi_tx_buf_count++ == 0) { // инкрементируем счётчик заполнения буфера
-		if (!spi_busy) { // если spi бездействует, запускаем передачу
-			TCNT1 = 0;
-			TCCR1B |= (1 << CS10); // Период такта таймера = 125 нс
-		}
+	spi_tx_buf[spi_tx_buf_w] = c;
+	if (spi_tx_buf_count++ == 0) {
+		if (!spi_busy) // если spi бездействует, запускаем передачу
+			spi_timer_slow();
 	}
 	sei();
 	if (++spi_tx_buf_w == SPI_TX_BUFFER_SIZE) {
@@ -496,17 +497,21 @@ void spi_send(uint8_t c) {
 
 // Обработчик прерывания таймера
 ISR(TIMER1_COMPA_vect) {
-	static uint8_t current_byte = 0;
+	static uint8_t current_byte;
+	static uint8_t current_bit;
 
-	switch (spi_bitcount){
+	switch (spi_state_machine){
 		case 0: if (ready2receive()) {
 					spi_busy = 1;
 					current_byte = spi_tx_buf[spi_tx_buf_r];
+					current_bit = 7;
 					if (++spi_tx_buf_r == (SPI_TX_BUFFER_SIZE)) {
 						spi_tx_buf_r = 0;
 					}
-					spi_tx_buf_count++;
-					spi_bitcount++;
+					spi_tx_buf_count--;
+					spi_timer_fast(); // Устанавливаем период передачи бит 2 мкс
+				} else {
+					break;
 				}
 		case 2:
 		case 4:
@@ -516,11 +521,11 @@ ISR(TIMER1_COMPA_vect) {
 		case 12:
 		case 14:
 				spi_sck_low();
-				if (current_byte & (1 << ((spi_bitcount << 1) - 1)))
+				if (current_byte & (1 << current_bit--))
 					spi_mosi_high();
 				else 
 					spi_mosi_low();
-				spi_bitcount++;
+				spi_state_machine++;
 				break;
 
 		case 1:
@@ -530,20 +535,25 @@ ISR(TIMER1_COMPA_vect) {
 		case 9:
 		case 11:
 		case 13:
-				spi_sck_high();
-				spi_bitcount++;
-				break;
 		case 15:
 				spi_sck_high();
-				spi_bitcount = 0;
-				if (!spi_tx_buf_count) { // Буфер пуст, остановить таймер
-					TCCR1B &= ~(1 << CS10);
-					spi_busy = 0;
-				}
+				spi_state_machine++;
 				break;
 
-		default:
-				spi_bitcount = 0;
+		case 16: // Остановка передачи
+				if (!spi_tx_buf_count) { // Буфер пуст
+					spi_timer_stop(); // остановить таймер
+					spi_busy = 0;
+				} else {
+					spi_timer_slow(); // Устанавливаем период ожидания для проверки линии подтверждения передачи
+				}
+				spi_sck_low();
+				spi_mosi_low();
+				spi_state_machine = 0;
+				break;
+
+		default: // Ошибка, сбрасываем устройство
+				ps2_state = ps2_state_error;
 	}
 }
 
@@ -570,8 +580,8 @@ void flash_led() {
 //---------------------------------------------------------------------------
 // Выключение светодиода через некоторое время
 ISR (TIMER2_OVF_vect) {
-    TCCR2 = 0; // Стоп таймер
-    led_disable();
+	TCCR2 = 0; // Стоп таймер
+	led_disable();
 }
 
 //===========================================================================
@@ -620,7 +630,6 @@ static void ps2m_init() {
 
 //---------------------------------------------------------------------------
 // Обработка поступивших с PS/2 порта данных
-
 void ps2m_process() {
 //	while (ps2_rx_buf_count < (3 + (ps2m_wheel ? 1 : 0))) {
 //	}
@@ -632,13 +641,13 @@ void ps2m_process() {
 			ps2m_z += (int8_t)ps2_read();
 		}
 	}
-}          
+}
 
+//---------------------------------------------------------------------------
 ISR (TIMER0_OVF_vect) { // 80.13 Hz
 	TCNT0 = TIMER0_CONST;
 
 	static uint8_t cnt = 0;
-	// TODO: Использовать информацию о чтении из COM порта для отправки данных
 	send_PS2_data_flag = cnt++ & 1;
 }
 
@@ -648,46 +657,46 @@ ISR (TIMER0_OVF_vect) { // 80.13 Hz
 //---------------------------------------------------------------------------
 // Отправка данных мыши через SPI
 void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
-    uint8_t lb, rb, mb;
-    static uint8_t mb1;
-    
-    // Обработка сброса      
-    if (spi_reset) {
-        spi_reset = false; 
-        _delay_ms(14);
-        if (mouse_protocol == PROTOCOL_EM84520) {
-            // Приветствие EM84520
-            for (uint8_t i = 0; i < sizeof(EM84520_ID); i++) {
-                spi_send(EM84520_ID[i]);
-            }
-        } else {
-            // Приветствие Logitech/Microsoft Plus
-            spi_send(0x4D);
-            _delay_ms(63);
-            spi_send(0x33);
-        }
-    }
-    
-    // Клавиши мыши
-    lb = b & 1;
-    rb = (b >> 1) & 1;
-    mb = (b >> 2) & 1;
+	uint8_t lb, rb, mb;
+	static uint8_t mb1;
 
-    // Стандартная часть протокола 
-    spi_send((1 << 6) | (lb << 5) | (rb << 4) | ((y & 0xC0) >> 4) | ((x & 0xC0) >> 6));
-    spi_send(x & 0x3F);
-    spi_send(y & 0x3F);
-    
-    if (mouse_protocol == PROTOCOL_EM84520) {
-        // Расширение EM84520
-        spi_send((mb << 4) | (z & 0x0F));
-    } else { 
-        // Расширение Logitech/Microsoft Plus
-        if (mb || mb1) {
-            spi_send(mb << 5);
-            mb1 = mb;
-        }
-    }       
+	// Обработка сброса      
+	if (spi_reset) {
+		spi_reset = false; 
+		_delay_ms(14);
+		if (mouse_protocol == PROTOCOL_EM84520) {
+			// Приветствие EM84520
+			for (uint8_t i = 0; i < sizeof(EM84520_ID); i++) {
+				spi_send(EM84520_ID[i]);
+			}
+		} else {
+			// Приветствие Logitech/Microsoft Plus
+			spi_send(0x4D);
+			_delay_ms(63);
+			spi_send(0x33);
+		}
+	}
+
+	// Клавиши мыши
+	lb = b & 1;
+	rb = (b >> 1) & 1;
+	mb = (b >> 2) & 1;
+
+	// Стандартная часть протокола 
+	spi_send((1 << 6) | (lb << 5) | (rb << 4) | ((y & 0xC0) >> 4) | ((x & 0xC0) >> 6));
+	spi_send(x & 0x3F);
+	spi_send(y & 0x3F);
+
+	if (mouse_protocol == PROTOCOL_EM84520) {
+		// Расширение EM84520
+		spi_send((mb << 4) | (z & 0x0F));
+	} else { 
+		// Расширение Logitech/Microsoft Plus
+		if (mb || mb1) {
+			spi_send(mb << 5);
+			mb1 = mb;
+		}
+	}
 }
 
 //===========================================================================
@@ -730,14 +739,14 @@ static void init(void) {
 	DDR(LED_PORT)  |= _BV(LED_PIN);  // pin 24 (PC1) как выход (LED)
 	PORT(LED_PORT) |= _BV(LED_PIN);  // PC1 = 1, LED OFF
 
-	DDR(ADC_PORT) &= ~_BV(ADC_2);  // pin 25 (PC2) вход IRQ3
-	PORT(ADC_PORT) &= ~_BV(ADC_2); // Отключить подтяжку PC2
+	DDR(ADC_PORT) &= ~_BV(IRQ3_PIN);  // pin 25 (PC2) вход IRQ3
+	PORT(ADC_PORT) &= ~_BV(IRQ3_PIN); // Отключить подтяжку PC2
 
-	DDR(ADC_PORT) &= ~_BV(ADC_3);  // pin 26 (PC3) вход IRQX
-	PORT(ADC_PORT) &= ~_BV(ADC_3); // Отключить подтяжку PC3
+	DDR(ADC_PORT) &= ~_BV(IRQX_PIN);  // pin 26 (PC3) вход IRQX
+	PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
 
-	DDR(ADC_PORT) &= ~_BV(ADC_4);  // pin 27 (PC4) вход IRQ4
-	PORT(ADC_PORT) &= ~_BV(ADC_4); // Отключить подтяжку PC4
+	DDR(ADC_PORT) &= ~_BV(IRQ4_PIN);  // pin 27 (PC4) вход IRQ4
+	PORT(ADC_PORT) &= ~_BV(IRQ4_PIN); // Отключить подтяжку PC4
 
 	DDR(SPI_SCK_PORT) |= _BV(SPI_SCK_PIN);  // pin 28 (PC5) как выход soft SPI CLC
 	PORT(SPI_SCK_PORT) &= ~_BV(SPI_SCK_PIN);  // PC5 = 0
@@ -747,8 +756,8 @@ static void init(void) {
 
 //---------------------------------------------------------------------------
 // Port D
-	DDR(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN);   // pin 30 (PD0) выход soft SPI reset
-	PORT(SPI_RESOUT_PORT) &= ~_BV(SPI_RESOUT_PIN); // PD0 = 0
+	DDR(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN);  // pin 30 (PD0) выход soft SPI reset
+	PORT(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN); // PD0 = 1 Сброс подсистемы SPI slave
 
 	DDR(SPI_MOSI_PORT) |= _BV(SPI_MOSI_PIN);   // pin 31 (PD1) выход soft SPI MOSI
 	PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN); // PD1 = 0
@@ -862,9 +871,9 @@ uint16_t adc_read(uint8_t channel) {
 uint8_t checkIRQ(uint8_t opt_com){
 	uint16_t tmp;
 
-	PORT(ADC_PORT) |= _BV(ADC_3); // Включить подтяжку PC3
-	tmp = adc_read(ADC_3);
-	PORT(ADC_PORT) &= ~_BV(ADC_3); // Отключить подтяжку PC3
+	PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
+	tmp = adc_read(IRQX_PIN);
+	PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
 
 	// Определяем используется ли прерывание IRQX (джампер опускает напряжение к 0)
 	if (tmp > IRQX_threshold) { // Напряжение на выводе IRQ выше заданного значения
@@ -883,7 +892,7 @@ int main(void) {
 	if (ps2m_multiplier > 2) {
 		ps2m_multiplier = 1; 
 	}
-    
+
 	init();
 	checkJumpers(); // Определяем конфигурацию джамперов
 	opt_irq_settings = checkIRQ(opt_com_settings);

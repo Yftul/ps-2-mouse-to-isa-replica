@@ -19,7 +19,12 @@
 
 #define PS2_SAMPLES_PER_SEC		40	// 10..200
 
-#define EEPROM_OFFSET_MULTIPLIER		0
+#define EEPROM_OFFSET_MULTIPLIER 0
+
+#define PS2_BUF_SIZE 256       // Размер приёмного буфера PS/2 порта
+#define SPI_TX_BUFFER_SIZE 16 // Размер буфера передачи SPI
+
+#define TIMER0_CONST 0x9F // Регулирует скорость передачи данных мыши
 
 //===========================================================================
 // pin definitions
@@ -64,7 +69,7 @@
 //===========================================================================
 // ADC каналы
 //===========================================================================
-#define ADC_PORT       C
+#define ADC_PORT  C
 #define IRQ3_PIN  2			// PC2 - нога 25 IRQ3
 #define IRQX_PIN  3			// PC3 - нога 26 IRQX
 #define IRQ4_PIN  4			// PC4 - нога 27 IRQ4
@@ -98,6 +103,12 @@
 #define spi_timer_slow()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS12) | (1 << CS10);}
 
 //===========================================================================
+// PS/2
+//===========================================================================
+#define ps2_data()				(PIN(PS2_DATA_PORT) & _BV(PS2_DATA_PIN))
+#define get_mouse_power_state() (PIN(DTR_PORT) & _BV(DTR_PIN))
+
+//===========================================================================
 // Select UART base address
 //===========================================================================
 #define SELECT_COM1 0
@@ -129,12 +140,6 @@
 //===========================================================================
 // Глобальные переменные
 //===========================================================================
-#define PS2_BUF_SIZE 256  // Размер приёмного буфера PS/2 порта
-#define TIMER0_CONST 0x9F
-
-#define ps2_data()  			(PIN(PS2_DATA_PORT) & _BV(PS2_DATA_PIN))
-#define get_mouse_power_state() (PIN(DTR_PORT) & _BV(DTR_PIN))
-
 enum ps_state_t { 
 	ps2_state_error, 
 	ps2_state_read, 
@@ -158,14 +163,12 @@ volatile uint8_t opt_duty_settings = 0;
 volatile uint8_t opt_rate_settings = 0;
 volatile uint8_t opt_irq_settings = 0;
 
-volatile bool ps2m_wheel; // Используемый протокол: 0=без колеса, 1=с колесом
+volatile uint8_t ps2m_wheel; // Используемый протокол: 0=без колеса, 1=с колесом
 volatile uint8_t ps2m_multiplier; // Масштабирование координат
 volatile uint8_t ps2m_b; // Нажатые кнопки
 volatile int16_t ps2m_x; // Координаты мыши
 volatile int16_t ps2m_y;
 volatile int16_t ps2m_z;
-
-#define SPI_TX_BUFFER_SIZE 256
 
 uint8_t spi_tx_buf[SPI_TX_BUFFER_SIZE];
 volatile uint8_t spi_tx_buf_w;
@@ -173,8 +176,10 @@ volatile uint8_t spi_tx_buf_r;
 volatile uint8_t spi_tx_buf_count;
 volatile uint8_t spi_state_machine;
 volatile uint8_t spi_busy;
-volatile bool spi_reset; // Необходима инициализация интерфейса soft spi
-volatile bool spi_enabled;
+
+volatile bool mouse_reset; // Необходима инициализация мыши
+volatile bool mouse_enabled;
+volatile bool device_init; // Произведена инициализация адресов/IRQ устройства
 
 #define PROTOCOL_MICROSOFT		0
 #define PROTOCOL_EM84520		1
@@ -205,8 +210,8 @@ uint8_t readCOMsettings(void) {
 	DDR(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);	// COM_SEL1 теперь выход
 	PORT(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);	// Запишем туда 0
 	t = ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0);
-	DDR(COM_SEL1_PORT) = ~_BV(COM_SEL1_PIN);    // COM_SEL1 теперь вход
-	PORT(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);	// Вернём подтяжку
+	DDR(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);   // COM_SEL1 теперь вход
+	PORT(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);   // Вернём подтяжку
 	if (t)
 		return SELECT_COM3;
 	else
@@ -244,14 +249,14 @@ uint8_t readRatesettings(void) {
 void ps2_rx_push(uint8_t c) {
 	// Если буфер переполнен и потерян байт, то программа не сможет правильно 
 	// расшифровать все дальнейшие пакеты, поэтому перезагружаем контроллер.
-	if (ps2_rx_buf_count >= sizeof(ps2_rx_buf)) {
+	if (ps2_rx_buf_count >= PS2_BUF_SIZE) {
 		ps2_state = ps2_state_error;
 		return;
 	}
 	// Сохраняем в буфер
 	ps2_rx_buf[ps2_rx_buf_w] = c;
 	ps2_rx_buf_count++;
-	if (++ps2_rx_buf_w == sizeof(ps2_rx_buf)) {
+	if (++ps2_rx_buf_w == PS2_BUF_SIZE) {
 		ps2_rx_buf_w = 0;
 	}
 }
@@ -259,23 +264,23 @@ void ps2_rx_push(uint8_t c) {
 //---------------------------------------------------------------------------
 // Получить байт из приёмного буфера PS/2 порта
 uint8_t ps2_read(void) {
-	uint8_t d;
+	uint8_t data;
 	
 	cli();	// Выключаем прерывания, так как обработчик прерывания тоже модифицирует эти переменные.
 	// Если буфер пуст, возвращаем ноль
 	if (ps2_rx_buf_count == 0) {
-		d = 0;
+		data = 0;
 	} else {
 		// Читаем байт из буфера
-		d = ps2_rx_buf[ps2_rx_buf_r];
+		data = ps2_rx_buf[ps2_rx_buf_r];
 		ps2_rx_buf_count--;
-		if (++ps2_rx_buf_r == sizeof(ps2_rx_buf)) {
+		if (++ps2_rx_buf_r == PS2_BUF_SIZE) {
 			ps2_rx_buf_r = 0;
 		}
 	}
 
 	sei();	// Включаем прерывания
-	return d;
+	return data;
 }
 
 //---------------------------------------------------------------------------
@@ -434,10 +439,10 @@ void ps2_send(uint8_t c) {
 // Изменилось состояние линий DTR или RTS
 ISR (INT0_vect) {
 	// Сохраняем состояние в переменную
-	spi_enabled = get_mouse_power_state();
+	mouse_enabled = get_mouse_power_state();
 
 	// Сохраняем признак сброса
-	spi_reset = true;
+	mouse_reset = true;
 }
 
 //===========================================================================
@@ -456,9 +461,9 @@ void spi_init(void) {
 	spi_mosi_low();   // MOSI низкий
 	spi_reset_low();  // Reset низкий
 
-	spi_enabled = get_mouse_power_state();
-	if (spi_enabled) {
-		spi_reset = true;
+	mouse_enabled = get_mouse_power_state();
+	if (mouse_enabled) {
+		mouse_reset = true;
 	}
 }
 
@@ -501,7 +506,8 @@ ISR(TIMER1_COMPA_vect) {
 	static uint8_t current_bit;
 
 	switch (spi_state_machine){
-		case 0: if (ready2receive()) {
+		case 0: if (!device_init || ready2receive()) {
+					device_init = 1;
 					spi_busy = 1;
 					current_byte = spi_tx_buf[spi_tx_buf_r];
 					current_bit = 7;
@@ -540,7 +546,7 @@ ISR(TIMER1_COMPA_vect) {
 				spi_state_machine++;
 				break;
 
-		case 16: // Остановка передачи
+		case 16: // Конец передачи
 				if (!spi_tx_buf_count) { // Буфер пуст
 					spi_timer_stop(); // остановить таймер
 					spi_busy = 0;
@@ -560,9 +566,7 @@ ISR(TIMER1_COMPA_vect) {
 // Отправка конфигурации устройства через SPI
 void spi_send_config(uint8_t opt_com, uint8_t opt_irq) {
 	uint8_t config_data = 0;
-	config_data &= ~(opt_com & 0x03);
 	config_data |= (opt_com & 0x03);
-	config_data &= ~((opt_irq & 0x03) << 2);
 	config_data |= ((opt_irq & 0x03) << 2);
 	spi_send(config_data);
 }
@@ -661,8 +665,8 @@ void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
 	static uint8_t mb1;
 
 	// Обработка сброса      
-	if (spi_reset) {
-		spi_reset = false; 
+	if (mouse_reset) {
+		mouse_reset = false; 
 		_delay_ms(14);
 		if (mouse_protocol == PROTOCOL_EM84520) {
 			// Приветствие EM84520
@@ -826,6 +830,8 @@ static void init(void) {
 	// Настройка Watchdog-таймера
 	wdt_enable(WDTO_1S);
 
+	device_init = false;
+
 	// Включение прерываний
 	sei();
 }
@@ -836,7 +842,7 @@ static void sentToSpi() {
 	
 	send_PS2_data_flag = false;
 
-	if (!spi_enabled)
+	if (!mouse_enabled)
 				return;
 
 	if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
@@ -872,6 +878,7 @@ uint8_t checkIRQ(uint8_t opt_com){
 	uint16_t tmp;
 
 	PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
+	_delay_us(25); // ждём стабилизацию уровня
 	tmp = adc_read(IRQX_PIN);
 	PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
 
@@ -906,20 +913,12 @@ int main(void) {
 	flash_led();
 
 	for(;;) {
-
-		if (send_PS2_data_flag) {
-			sentToSpi();
-		}
-		
 		// читаем данные из PS/2
 		ps2m_process();
 
-		// Отправляем компьютеру пакет, если буфер отправки пуст, мышь включена, 
+		// Отправляем компьютеру пакет, если в буфере отправки есть место, мышь включена, 
 		// изменились нажатые кнопки или положение мыши
-        
-		// Отправляем данные через SPI
 		if (send_PS2_data_flag) {
-			TCNT0 = TIMER0_CONST;
 			sentToSpi();
 		}
 

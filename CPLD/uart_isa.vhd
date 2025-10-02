@@ -29,8 +29,10 @@ end uart_isa;
 architecture Behavioral of uart_isa is
     -- Регистры UART
     signal rx_data_reg    : std_logic_vector(7 downto 0) := (others => '0');  -- 0x3F8h IN
-    signal mdm_ctl_reg    : std_logic_vector(7 downto 0) := (others => '0');  -- 0x3FEh IN
-    signal line_ctl_reg   : std_logic_vector(7 downto 0) := (others => '0');  -- 0x3FBh OUT
+    signal tx_data_reg    : std_logic_vector(7 downto 0) := (others => '0');  -- 0x3F8h OUT
+    signal mdm_ctl_reg    : std_logic_vector(7 downto 0) := (others => '0');
+    signal line_ctl_reg   : std_logic_vector(7 downto 0) := (others => '0');
+--    signal line_stat_reg  : std_logic_vector(7 downto 0) := (others => '0');
 
     -- Регистры накопления данных UART
     signal rx_acc_reg     : std_logic_vector(7 downto 0) := (others => '0');    -- Аккумулятор бит от MCU
@@ -73,12 +75,18 @@ begin
                             end if;
                         when "001" => -- Регистр разрешения прерывания
                             if line_ctl_reg(7) = '0' then -- DLAB check
-                                data_out <= "0000001" & not RxD_IRQ; -- Готовность передачи всегда включена
+                                data_out <= "000000" & TxD_IE & RxD_IE;
                             end if;
                         when "010" => -- причина прерывания: xxxxx10x = принят символ; сбрасывается чтением приемника
-                            data_out <= "00000" & RxD_IRQ & "00";
+                            if RxD_IRQ = '1' then -- Прерывание готовности принятого символа
+                              data_out <= "00000100"; -- Сигнализация готовности принятого символа
+                            else
+                              data_out <= "00000010"; -- Сигнализация готовности передачи символа
+                            end if;
                         when "011" => data_out <= line_ctl_reg;
+--                        when "100" => data_out <= "000" & mdm_ctl_reg(4 downto 0); -- Почему-то занимает на 1 ячейку больше, чем вариант ниже
                         when "100" => data_out <= std_logic_vector(bit_counter) & mdm_ctl_reg(4 downto 0);
+                        when "101" => data_out <= "0010000" & RxD_IRQ;
                         when others => data_out <= (others => '0');
                     end case;
                 else
@@ -96,6 +104,8 @@ begin
             if rising_edge(isa_iow) then -- Запись в регистры UART
                 if (device_select = '1') then
                     case isa_addr(2 downto 0) is
+                        when "000" =>
+                            tx_data_reg <= isa_data;
                         when "001" =>
                             if line_ctl_reg(7) = '0' then -- DLAB check
                                 -- Регистр разрешения прерываний
@@ -104,6 +114,7 @@ begin
                             end if;
                         when "011" => line_ctl_reg <= isa_data;
                         when "100" => mdm_ctl_reg <= isa_data;
+--                            when "101" => line_stat_reg <= isa_data;
                         when others => null;
                     end case;
                 end if;
@@ -189,8 +200,7 @@ begin
     device_select <= '1' when isa_aen = '0' and base_addr_rdy = '1' and 
                             isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val))) else '0';
 
-    isa_data <= data_out when isa_reset = '0' and device_select = '1' and
-                                isa_ior = '0' and isa_iow = '1' else (others => 'Z');
+    isa_data <= data_out when isa_reset = '0' and device_select = '1' and isa_ior = '0' else (others => 'Z');
 
     Enable_IRQ <= RxD_IE or mdm_ctl_reg(3); -- OUT2 также разрешает прерывания
     IRQ4 <= RxD_IRQ when base_irq_val = "01" and Enable_IRQ = '1' else 'Z'; -- COM1/COM3

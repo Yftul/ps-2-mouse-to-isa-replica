@@ -127,8 +127,9 @@ begin
     end process;
 
     process(mcu_clk, mcu_res, bit_counter) begin -- Работа с MCU
-        if mcu_res = '1' then         -- Сброс от MCU
+        if mcu_res = '1' then        -- Сброс от MCU
             base_addr_rdy <= '0';    -- Сбрасываем готовность базового адреса устройства
+            recv_data_rdy <= '0';
         else
             if falling_edge(mcu_clk) and (bit_counter = "000") then -- Верифицируем по спаду
                 if (base_addr_rdy = '0') then -- Первый байт данных от MCU - приходит базовый адрес устройства и номер IRQ
@@ -185,7 +186,7 @@ begin
     mcu_isa_res <= not isa_reset; -- Передача сигнала сброса ISA шины на MCU
     mcu_DTR <= mdm_ctl_reg(0);    -- Управление питанием мыши
 
-    device_select <= '1' when isa_aen = '1' and base_addr_rdy = '1' and 
+    device_select <= '1' when isa_aen = '0' and base_addr_rdy = '1' and 
                             isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val))) else '0';
 
     isa_data <= data_out when isa_reset = '0' and device_select = '1' and
@@ -197,3 +198,4 @@ begin
     IRQX <= RxD_IRQ when base_irq_val = "11" and Enable_IRQ = '1' else 'Z'; -- Custom
 
 end Behavioral;
+

@@ -11,10 +11,10 @@ entity uart_isa is
         isa_ior      : in  std_logic; -- pin 18
         isa_aen      : in  std_logic; -- pin 19
         isa_reset    : in  std_logic; -- pin 33
-        
+
         -- MCU Interface
         mcu_isa_res  : out std_logic; -- pin 34, сброс MCU
-        mcu_DTR	     : out std_logic; -- pin 35, Признак включения мыши для MCU
+        mcu_DTR      : out std_logic; -- pin 35, Признак включения мыши для MCU
         mcu_rxd      : in  std_logic; -- pin 38, SPI, данные в регистр приема от MCU
         mcu_clk      : in  std_logic; -- pin 40, SPI, такты от MCU
         mcu_res      : in  std_logic; -- pin 39, SPI, синхронизация от MCU
@@ -23,7 +23,7 @@ entity uart_isa is
         IRQ3         : out  std_logic := 'Z'; -- pin 44
         IRQ4         : out  std_logic := 'Z'; -- pin 42
         IRQX         : out  std_logic := 'Z'  -- pin 43
-	  );
+      );
 end uart_isa;
 
 architecture Behavioral of uart_isa is
@@ -33,8 +33,8 @@ architecture Behavioral of uart_isa is
     signal line_ctl_reg   : std_logic_vector(7 downto 0) := (others => '0');  -- 0x3FBh OUT
 
     -- Регистры накопления данных UART
-    signal rx_acc_reg     : std_logic_vector(7 downto 0) := (others => '0');	-- Аккумулятор бит от MCU
-    signal bit_counter	  : unsigned(2 downto 0) := (others => '0');			   -- Счётчик бит от MCU
+    signal rx_acc_reg     : std_logic_vector(7 downto 0) := (others => '0');    -- Аккумулятор бит от MCU
+    signal bit_counter    : unsigned(2 downto 0) := (others => '0');            -- Счётчик бит от MCU
 
     -- Сигналы управления IRQ
     signal SET_RxD_IRQ    : std_logic := '0'; -- сигнал запроса установки RxD_IRQ
@@ -49,9 +49,10 @@ architecture Behavioral of uart_isa is
     signal data_out       : std_logic_vector(7 downto 0) := (others => '0'); -- Буфер вывода данных ISA
     signal base_irq_val   : std_logic_vector(1 downto 0) := "00";            -- IRQ по умолчанию после включения
     signal base_addr_val  : std_logic_vector(1 downto 0) := "00";            -- Компорт по умолчанию после включения
-    signal base_addr_rdy  : std_logic := '1'; -- Устройство не готово к обмену по ISA сразу после включения;
+    signal base_addr_rdy  : std_logic := '0'; -- Устройство не готово к обмену по ISA сразу после включения;
+    signal recv_data_rdy  : std_logic := '0'; -- Готовность принятых данных;
 
-	 -- Сигналы адресного компаратора
+     -- Сигналы адресного компаратора
     type base_addr_array_t is array (0 to 3) of std_logic_vector(6 downto 0);
     constant BASE_ADDR_ROM : base_addr_array_t := (
         0 => "1111111", -- COM1 = 0x3F8 >> 3 = 0x7F
@@ -60,14 +61,6 @@ architecture Behavioral of uart_isa is
         3 => "1011101"  -- COM4 = 0x2E8 >> 3 = 0x5D
 );
 begin
-    process(isa_reset, RES_RxD_IRQ, SET_RxD_IRQ) begin -- RS триггер состояния прерывания приёма данных
-        if isa_reset = '1' or RES_RxD_IRQ = '1' then
-            RxD_IRQ <= '0';
-        elsif SET_RxD_IRQ = '1' then
-            RxD_IRQ <= '1';
-        end if;
-    end process;
-
     process(isa_ior, isa_reset) -- Асинхронное чтение регистров UART c ISA шины
     begin
         if isa_reset = '0' then
@@ -118,15 +111,25 @@ begin
         end if;
     end process;
 
-    process(mcu_clk, mcu_res, bit_counter) begin -- Работа с MCU
-        if mcu_res = '1' then 		-- Сброс от MCU
-            bit_counter <= "000"; 	-- Сбрасываем счётчик
-            base_addr_rdy 	<= '0';	-- Сбрасываем готовность базового адреса устройства
+    process(mcu_clk, mcu_res) begin -- Работа с MCU
+        if mcu_res = '1' then         -- Сброс от MCU
+            bit_counter <= "000";     -- Сбрасываем счётчик
         else
             if rising_edge(mcu_clk) then -- Записываем данные по фронту сигнала
-                rx_acc_reg(1 - to_integer(bit_counter)) <= mcu_rxd;
-                bit_counter <= bit_counter + 1;
-            end if;
+                rx_acc_reg(7 - to_integer(bit_counter)) <= mcu_rxd;
+                if bit_counter = 7 then
+                    bit_counter <= (others => '0');
+                else
+                    bit_counter <= bit_counter + 1;
+                end if;
+                 end if;
+        end if;
+    end process;
+
+    process(mcu_clk, mcu_res, bit_counter) begin -- Работа с MCU
+        if mcu_res = '1' then         -- Сброс от MCU
+            base_addr_rdy <= '0';    -- Сбрасываем готовность базового адреса устройства
+        else
             if falling_edge(mcu_clk) and (bit_counter = "000") then -- Верифицируем по спаду
                 if (base_addr_rdy = '0') then -- Первый байт данных от MCU - приходит базовый адрес устройства и номер IRQ
                     base_addr_val(1 downto 0) <= rx_acc_reg(1 downto 0); -- Базовый адрес устройства
@@ -134,26 +137,33 @@ begin
                     base_addr_rdy <= '1'; -- Готовность устройства(если не установлено по умолчанию)
                 else  -- Последующие данные от мыши
                     rx_data_reg <= rx_acc_reg;
+                          recv_data_rdy <= '1'; -- Готовность принятых данных
                 end if;
             end if;
         end if;
     end process;
 
-    process(isa_reset, mcu_res, mcu_clk) -- Процесс формирования сигнала установки прерывания
+    process(isa_reset, mcu_res, mcu_clk, recv_data_rdy, RxD_IRQ) -- Процесс формирования сигнала установки прерывания
     begin
-        if isa_reset = '1' or mcu_res = '1' then -- Сброс от ISA или MCU
-            SET_RxD_IRQ <= '0';	-- Сбрасываем признак прерывания
+        if isa_reset = '1' then -- Сброс от ISA
+            SET_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
+        elsif mcu_res = '1' then -- Сброс от MCU
+            SET_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
+        elsif RxD_IRQ = '1' then
+            SET_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
         elsif falling_edge(mcu_clk) then -- Верифицируем по спаду
-            if (bit_counter = "000") and (base_addr_rdy = '1') then -- Если байт принят и есть готовность настроек
+            if (bit_counter = "000") and (recv_data_rdy = '1') then -- Если байт принят и есть готовность данных
                 SET_RxD_IRQ <= '1'; -- Устанавливаем признак прерывания
             end if;
         end if;
     end process;
 
-    process(isa_ior, isa_reset) -- Процесс формирования сигнала сброса прерывания
+    process(isa_ior, isa_reset, RxD_IRQ) -- Процесс формирования сигнала сброса прерывания
     begin
         if isa_reset = '1' then
             RES_RxD_IRQ <= '0';
+        elsif RxD_IRQ = '0' then
+            RES_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
         elsif falling_edge(isa_ior) then
             if (device_select = '1' and isa_addr(2 downto 0) = "000") then -- при чтении принятых данных cбрасываем прерывание  
                 RES_RxD_IRQ <= '1'; -- Устанавливаем признак сброса прерывания
@@ -163,8 +173,16 @@ begin
         end if;
     end process;
 
+    process(isa_reset, RES_RxD_IRQ, SET_RxD_IRQ) begin -- RS триггер состояния прерывания приёма данных
+        if isa_reset = '1' or RES_RxD_IRQ = '1' then
+            RxD_IRQ <= '0';
+        elsif SET_RxD_IRQ = '1' then
+            RxD_IRQ <= '1';
+        end if;
+    end process;
+
     -- Комбинаторная логика
-    mcu_isa_res	<= not isa_reset; -- Передача сигнала сброса ISA шины на MCU
+    mcu_isa_res <= not isa_reset; -- Передача сигнала сброса ISA шины на MCU
     mcu_DTR <= mdm_ctl_reg(0);    -- Управление питанием мыши
 
     device_select <= '1' when isa_aen = '1' and base_addr_rdy = '1' and 

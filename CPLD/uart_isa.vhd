@@ -32,7 +32,6 @@ architecture Behavioral of uart_isa is
     signal tx_data_reg    : std_logic_vector(7 downto 0) := (others => '0');  -- 0x3F8h OUT
     signal mdm_ctl_reg    : std_logic_vector(7 downto 0) := (others => '0');
     signal line_ctl_reg   : std_logic_vector(7 downto 0) := (others => '0');
---    signal line_stat_reg  : std_logic_vector(7 downto 0) := (others => '0');
 
     -- Регистры накопления данных UART
     signal rx_acc_reg     : std_logic_vector(7 downto 0) := (others => '0');    -- Аккумулятор бит от MCU
@@ -67,11 +66,16 @@ begin
     begin
         if isa_reset = '0' then
             if falling_edge(isa_ior) then -- Чтение из регистров UART
+                data_out <= (others => '0');
                 if (device_select = '1') then
                     case isa_addr(2 downto 0) is
                         when "000" => -- Регистр данных
-                            if line_ctl_reg(7) = '0' then
-                                data_out <= rx_data_reg; -- Прочитали данные UART
+                            if line_ctl_reg(7) = '0' then -- DLAB check
+                                if (mdm_ctl_reg(4) = '0') then
+                                    data_out <= rx_data_reg; -- Прочитали данные UART
+                                else -- Loop mode
+--                                    data_out <= tx_data_reg; -- не хватает макроячеек для реализации
+                                end if;
                             end if;
                         when "001" => -- Регистр разрешения прерывания
                             if line_ctl_reg(7) = '0' then -- DLAB check
@@ -84,13 +88,18 @@ begin
                               data_out <= "00000010"; -- Сигнализация готовности передачи символа
                             end if;
                         when "011" => data_out <= line_ctl_reg;
---                        when "100" => data_out <= "000" & mdm_ctl_reg(4 downto 0); -- Почему-то занимает на 1 ячейку больше, чем вариант ниже
-                        when "100" => data_out <= std_logic_vector(bit_counter) & mdm_ctl_reg(4 downto 0);
+--                        when "100" => data_out <= mdm_ctl_reg;
+                        when "100" => data_out <= "000" & mdm_ctl_reg(4 downto 0); -- Почему-то иногда занимает на 1 ячейку больше, чем вариант ниже
+--                        when "100" => data_out <= std_logic_vector(bit_counter) & mdm_ctl_reg(4 downto 0);
                         when "101" => data_out <= "0010000" & RxD_IRQ;
-                        when others => data_out <= (others => '0');
+                        when "110" => 
+                            if (mdm_ctl_reg(4) = '0') then
+                                data_out <= "00110000"; -- CTS | DSR
+                            else -- Loop mode
+                                data_out <= mdm_ctl_reg(3) & mdm_ctl_reg(2) & mdm_ctl_reg(0) & mdm_ctl_reg(1) & "0000"; -- OUT2 & OUT1 & DTR & RTS 
+                            end if;
+                        when others => null;
                     end case;
-                else
-                    data_out <= (others => '0');
                 end if;
             end if;
         end if;
@@ -114,7 +123,6 @@ begin
                             end if;
                         when "011" => line_ctl_reg <= isa_data;
                         when "100" => mdm_ctl_reg <= isa_data;
---                            when "101" => line_stat_reg <= isa_data;
                         when others => null;
                     end case;
                 end if;
@@ -149,7 +157,7 @@ begin
                     base_addr_rdy <= '1'; -- Готовность устройства(если не установлено по умолчанию)
                 else  -- Последующие данные от мыши
                     rx_data_reg <= rx_acc_reg;
-                          recv_data_rdy <= '1'; -- Готовность принятых данных
+                    recv_data_rdy <= '1'; -- Готовность принятых данных
                 end if;
             end if;
         end if;
@@ -157,11 +165,7 @@ begin
 
     process(isa_reset, mcu_res, mcu_clk, recv_data_rdy, RxD_IRQ) -- Процесс формирования сигнала установки прерывания
     begin
-        if isa_reset = '1' then -- Сброс от ISA
-            SET_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
-        elsif mcu_res = '1' then -- Сброс от MCU
-            SET_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
-        elsif RxD_IRQ = '1' then
+	     if isa_reset = '1' or mcu_res = '1' or RxD_IRQ = '1' then
             SET_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
         elsif falling_edge(mcu_clk) then -- Верифицируем по спаду
             if (bit_counter = "000") and (recv_data_rdy = '1') then -- Если байт принят и есть готовность данных
@@ -195,7 +199,7 @@ begin
 
     -- Комбинаторная логика
     mcu_isa_res <= not isa_reset; -- Передача сигнала сброса ISA шины на MCU
-    mcu_DTR <= mdm_ctl_reg(0);    -- Управление питанием мыши
+    mcu_DTR <= mdm_ctl_reg(4) and (mdm_ctl_reg(0) or mdm_ctl_reg(1)); -- Управление питанием мыши, !LOOP & (DTR | RTS)
 
     device_select <= '1' when isa_aen = '0' and base_addr_rdy = '1' and 
                             isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val))) else '0';
@@ -208,4 +212,3 @@ begin
     IRQX <= RxD_IRQ when base_irq_val = "11" and Enable_IRQ = '1' else 'Z'; -- Custom
 
 end Behavioral;
-

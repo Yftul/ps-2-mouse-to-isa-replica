@@ -15,18 +15,14 @@
 #include <util/delay.h>
 #include "stddef.h"
 
-#define EEPROM_OFFSET_MULTIPLIER    0
-
 #define PS2_BUF_SIZE 256       // Размер приёмного буфера PS/2 порта
-#define SPI_TX_BUFFER_SIZE 16 // Размер буфера передачи SPI
+#define SPI_TX_BUFFER_SIZE 256 // Размер буфера передачи SPI
 
 #define TIMER0_CONST 0x9F // Регулирует скорость передачи данных мыши
 
 //===========================================================================
 // pin definitions
 //===========================================================================
-//#define SPI_MISO_PORT    D            // TODO: переделать на выход MCU_reset
-//#define SPI_MISO_PIN    0            // PD0 - нога 30
 #define SPI_RESOUT_PORT   D
 #define SPI_RESOUT_PIN    0            // PD0 - нога 30
 #define SPI_MOSI_PORT     D
@@ -161,7 +157,6 @@ volatile uint8_t opt_rate_settings;
 volatile uint8_t opt_irq_settings;
 
 volatile uint8_t ps2m_wheel; // Используемый протокол: 0=без колеса, 1=с колесом
-volatile uint8_t ps2m_multiplier; // Масштабирование координат
 volatile uint8_t ps2m_b; // Нажатые кнопки
 volatile int16_t ps2m_x; // Координаты мыши
 volatile int16_t ps2m_y;
@@ -503,19 +498,18 @@ ISR(TIMER1_COMPA_vect) {
     static uint8_t current_bit;
 
     switch (spi_state_machine) {
-        case 0: if (ready2receive() || !device_init) {
-                    device_init = 1;
-                    spi_busy = 1;
-                    current_byte = spi_tx_buf[spi_tx_buf_r];
-                    current_bit = 7;
-                    if (++spi_tx_buf_r == (SPI_TX_BUFFER_SIZE)) {
-                        spi_tx_buf_r = 0;
-                    }
-                    spi_tx_buf_count--;
-                    spi_timer_fast(); // Устанавливаем период для передачи данных
-                } else {
-                    break;
+        case 0: 
+                if (!ready2receive() && device_init)
+                                                 break;
+                device_init = 1;
+                spi_busy = 1;
+                current_byte = spi_tx_buf[spi_tx_buf_r];
+                current_bit = 7;
+                if (++spi_tx_buf_r == SPI_TX_BUFFER_SIZE) {
+                    spi_tx_buf_r = 0;
                 }
+                spi_tx_buf_count--;
+                spi_timer_fast(); // Устанавливаем период для передачи данных
         case 2:
         case 4:
         case 6:
@@ -592,6 +586,8 @@ ISR (TIMER2_OVF_vect) {
 //---------------------------------------------------------------------------
 // Инициализация PS/2 мыши
 static void ps2m_init() {
+    const uint8_t wheel_sequence[] = {0xF3, 0xC8, 0xF3, 0x64, 0xF3, 0x50, 0xF2};
+
     // Посылаем команду "Сброс"
     ps2_send(0xFF);
     if (ps2_recv() != 0xAA) { 
@@ -602,19 +598,16 @@ static void ps2m_init() {
         ps2_state = ps2_state_error; 
         return; 
     }
-    
-    if (opt_wheel_enabled) {
-        // Включаем колесо и побочно устанавливаем 80 пакетов в секунду.    
-        ps2_send(0xF3);
-        ps2_send(0xC8);
-        ps2_send(0xF3);
-        ps2_send(0x64);
-        ps2_send(0xF3);
-        ps2_send(0x50);
 
-        // Узнаём, получилось ли включить колесо
-        ps2_send(0xF2);
-        ps2m_wheel = ps2_recv();
+    flash_led(); // Мышь инициализирована
+
+    if (opt_wheel_enabled) {
+        // Включаем колесо и побочно устанавливаем 80 пакетов в секунду.
+        for (uint8_t i = 0; i < sizeof(wheel_sequence);++i) {
+            ps2_send(wheel_sequence[i]);
+        }
+        
+        ps2m_wheel = ps2_recv(); // Узнаём, получилось ли включить колесо
     }
 
     // Разрешение 8 точек на мм
@@ -836,23 +829,26 @@ static void init(void) {
 //---------------------------------------------------------------------------
 static void sentToSpi() {
     static uint8_t smb1 = 0;
+    static uint8_t dr_ctr = 0;
     
+    if (!send_PS2_data_flag || !mouse_enabled) return;
+
     send_PS2_data_flag = false;
+    dr_ctr = (dr_ctr + 1) & 0x03;
 
-    if (!mouse_enabled)
-                return;
+    if (dr_ctr > opt_duty_settings) { // пропускаем 0, 1 или 2 такта из 4
+        if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
+            int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
+            ps2m_x -= cx;
+            int8_t cy = ps2m_y < -128 ? -128 : (ps2m_y > 127 ? 127 : ps2m_y); 
+            ps2m_y -= cy;
+            int8_t cz = ps2m_z < -8   ? -8   : (ps2m_z > 7   ?   7 : ps2m_z); 
+            ps2m_z -= cz;
+            
+            smb1 = ps2m_b;
 
-    if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
-        int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
-        ps2m_x -= cx;
-        int8_t cy = ps2m_y < -128 ? -128 : (ps2m_y > 127 ? 127 : ps2m_y); 
-        ps2m_y -= cy;
-        int8_t cz = ps2m_z < -8   ? -8   : (ps2m_z > 7   ?   7 : ps2m_z); 
-        ps2m_z -= cz;
-        
-        smb1 = ps2m_b;
-        spi_m_send(cx, cy, cz, ps2m_b);
-        flash_led();
+            spi_m_send(cx, cy, cz, ps2m_b);
+        }
     }
 }
 
@@ -875,7 +871,7 @@ uint8_t checkIRQ(uint8_t opt_com) {
     uint16_t tmp;
 
     PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
-    _delay_us(25); // ждём стабилизацию уровня
+    _delay_us(5); // ждём стабилизацию уровня
     tmp = adc_read(IRQX_PIN);
     PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
 
@@ -891,12 +887,6 @@ uint8_t checkIRQ(uint8_t opt_com) {
 }
 
 int main(void) {
-    // Восстанавливаем настройки
-    ps2m_multiplier = eeprom_read_byte(EEPROM_OFFSET_MULTIPLIER);
-    if (ps2m_multiplier > 2) {
-        ps2m_multiplier = 1; 
-    }
-
     init();
     checkJumpers(); // Определяем конфигурацию джамперов
     opt_irq_settings = checkIRQ(opt_com_settings);
@@ -907,36 +897,12 @@ int main(void) {
     ps2_init();
     ps2m_init();
 
-    flash_led();
-
     for(;;) {
-        // читаем данные из PS/2
-        ps2m_process();
-
-        // Отправляем компьютеру пакет, если в буфере отправки есть место, мышь включена, 
-        // изменились нажатые кнопки или положение мыши
-        if (send_PS2_data_flag) {
-            sentToSpi();
-        }
-
-        // Регулирование скорости мыши прямо с мыши
-        if (mouse_protocol == PROTOCOL_MICROSOFT && (ps2m_b & 3) == 3) {
-            if (ps2m_z < 0) { 
-                if (ps2m_multiplier > 0) {
-                    ps2m_multiplier--; 
-                }
-                ps2m_z = 0; 
-            } else if (ps2m_z > 0) { 
-                if (ps2m_multiplier < 2) {
-                    ps2m_multiplier++;
-                }
-                ps2m_z = 0; 
-            }
-        }
-
-        // В случае ошибки перезагружаемся
         if (ps2_state != ps2_state_error) {
             wdt_reset();
         }
+
+        ps2m_process();
+        sentToSpi();
     }
 }

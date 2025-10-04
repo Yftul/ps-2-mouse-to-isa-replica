@@ -13,12 +13,21 @@
 #define F_CPU 8000000UL
 
 #include <util/delay.h>
-#include "stddef.h"
+#include <util/atomic.h>
 
 #define PS2_BUF_SIZE 256       // Размер приёмного буфера PS/2 порта
 #define SPI_TX_BUFFER_SIZE 256 // Размер буфера передачи SPI
 
 #define TIMER0_CONST 0x9F // Регулирует скорость передачи данных мыши
+#define TIMER1_CONST 0x0F // Регулирует битовую скорость передачи SPI
+
+#define GLUE(a, b)     a##b
+
+#define PORT(x)        GLUE(PORT, x)
+#define PIN(x)         GLUE(PIN, x)
+#define DDR(x)         GLUE(DDR, x)
+#define likely(x)      __builtin_expect(!!(x), 1)
+#define unlikely(x)    __builtin_expect(!!(x), 0)
 
 //===========================================================================
 // pin definitions
@@ -77,8 +86,8 @@
 //===========================================================================
 // Светодиод
 //===========================================================================
-#define led_enable()        PORT(LED_PORT) &= ~_BV(LED_PIN);
-#define led_disable()       PORT(LED_PORT) |= _BV(LED_PIN);
+#define led_on()        PORT(LED_PORT) &= ~_BV(LED_PIN);
+#define led_off()       PORT(LED_PORT) |= _BV(LED_PIN);
 
 //===========================================================================
 // Soft SPI
@@ -97,30 +106,37 @@
 //===========================================================================
 // PS/2
 //===========================================================================
-#define ps2_data()              (PIN(PS2_DATA_PORT) & _BV(PS2_DATA_PIN))
+#define ps2_data_pin()          (PIN(PS2_DATA_PORT) & _BV(PS2_DATA_PIN))
 #define get_mouse_power_state() (PIN(DTR_PORT) & _BV(DTR_PIN))
 
 //===========================================================================
 // Select UART base address
 //===========================================================================
-#define SELECT_COM1 0
-#define SELECT_COM2 1
-#define SELECT_COM3 2
-#define SELECT_COM4 3
+typedef enum {
+    SELECT_COM1 = 0,
+    SELECT_COM2 = 1,
+    SELECT_COM3 = 2,
+    SELECT_COM4 = 3,
+} com_select_t;
 
 //===========================================================================
 // Select UART IRQ
 //===========================================================================
-#define USE_IRQ4 1
-#define USE_IRQ3 2
-#define USE_IRQX 3
+typedef enum {
+    NO_USE_IRQ = 0,
+    USE_IRQ4 = 1,
+    USE_IRQ3 = 2,
+    USE_IRQX = 3,
+} use_irq_t;
 
 //===========================================================================
 // Select mouse Duty cycles
 //===========================================================================
-#define DUTY_100 0
-#define DUTY_75  1
-#define DUTY_50  2
+typedef enum {
+    DUTY_100 = 0,
+    DUTY_75 = 1,
+    DUTY_50 = 2,
+} duty_t;
 
 //===========================================================================
 // Select data rate
@@ -139,11 +155,11 @@ enum ps_state_t {
     ps2_state_write 
 };
 
-volatile uint8_t ps2_state;                // состояние порта (ps_state_t)
-volatile uint8_t ps2_bitcount;             // счётчик битов обработчика
-volatile uint8_t ps2_data;                 // буфер на байт
+volatile uint8_t ps2_state;       // состояние порта (ps_state_t)
+volatile uint8_t ps2_bitcount;    // счётчик битов обработчика
+volatile uint8_t ps2_data;        // буфер на байт
 volatile uint8_t ps2_parity;
-volatile uint8_t ps2_rx_buf[PS2_BUF_SIZE]; // Приёмный буфер PS/2 порта
+uint8_t ps2_rx_buf[PS2_BUF_SIZE]; // Приёмный буфер PS/2 порта
 volatile uint8_t ps2_rx_buf_w;
 volatile uint8_t ps2_rx_buf_r;
 volatile uint8_t ps2_rx_buf_count;
@@ -173,8 +189,10 @@ volatile bool mouse_reset; // Необходима инициализация м
 volatile bool mouse_enabled;
 volatile bool device_init; // Произведена инициализация адресов/IRQ устройства
 
-#define PROTOCOL_MICROSOFT      0
-#define PROTOCOL_EM84520        1
+typedef enum {
+    PROTOCOL_MICROSOFT = 0,
+    PROTOCOL_EM84520 = 1,
+} ms_protocols_t;
 
 uint8_t mouse_protocol = PROTOCOL_MICROSOFT; // Используемый протокол: 0=MSMouse, 1=EM84520
 
@@ -187,108 +205,32 @@ const uint8_t EM84520_ID[61] = {
     0x09
 };
 
-//---------------------------------------------------------------------------
-// Чтение джамперов
-uint8_t readCOMsettings(void) {
-    bool t = false;
-    if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 0) &&
-        ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 1))
-            return SELECT_COM2;
-    if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 1) &&
-        ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0))
-            return SELECT_COM4;
+//===========================================================================
+// Декларации функций
+//===========================================================================
+void ps2_rx_push(uint8_t c);
+bool ready2receive(void);
 
-    // Перемычки на землю не обнаружены, проверяем перемычу между джамперами
-    DDR(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);    // COM_SEL1 теперь выход
-    PORT(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);  // Запишем туда 0
-    t = ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0);
-    DDR(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);   // COM_SEL1 теперь вход
-    PORT(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);   // Вернём подтяжку
-    if (t)
-        return SELECT_COM3;
-    else
-        return SELECT_COM1;
-}
+//===========================================================================
+// Прерывания
+//===========================================================================
+// Изменилось состояние линий DTR или RTS
+ISR (INT0_vect) {
+    // Сохраняем состояние в переменную
+    mouse_enabled = get_mouse_power_state();
 
-bool readWheelsettings(void) {
-    if ((PIN(WHEEL_SEL_PORT) & _BV(WHEEL_SEL_PIN)) == 0)
-        return true;
-    return false;
-}
+    // Сохраняем признак сброса
+    mouse_reset = true;
 
-uint8_t readDutysettings(void) {
-    if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 0) &&
-        ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 1))
-            return DUTY_50;
-    if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 1) &&
-        ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 0))
-            return DUTY_75;
-    return DUTY_100;
-}
-
-uint8_t readRatesettings(void) {
-    if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 0) &&
-        ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 1))
-            return PS2_SAMPLES_PER_SEC_SLOW;
-    if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 1) &&
-        ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 0))
-            return PS2_SAMPLES_PER_SEC_MID;
-    return PS2_SAMPLES_PER_SEC_FAST;
-}
-
-//---------------------------------------------------------------------------
-// Сохранить принятый байт в буфер приёма PS/2 порта. Вызывается только из обработчика прерывания.
-void ps2_rx_push(uint8_t c) {
-    // Если буфер переполнен и потерян байт, то программа не сможет правильно 
-    // расшифровать все дальнейшие пакеты, поэтому перезагружаем контроллер.
-    if (ps2_rx_buf_count >= PS2_BUF_SIZE) {
-        ps2_state = ps2_state_error;
-        return;
-    }
-    // Сохраняем в буфер
-    ps2_rx_buf[ps2_rx_buf_w] = c;
-    ps2_rx_buf_count++;
-    if (++ps2_rx_buf_w == PS2_BUF_SIZE) {
-        ps2_rx_buf_w = 0;
-    }
-}
-
-//---------------------------------------------------------------------------
-// Получить байт из приёмного буфера PS/2 порта
-uint8_t ps2_read(void) {
-    uint8_t data;
-    
-    cli(); // Выключаем прерывания, так как обработчик прерывания тоже модифицирует эти переменные.
-    // Если буфер пуст, возвращаем ноль
-    if (ps2_rx_buf_count == 0) {
-        data = 0;
-    } else {
-        // Читаем байт из буфера
-        data = ps2_rx_buf[ps2_rx_buf_r];
-        ps2_rx_buf_count--;
-        if (++ps2_rx_buf_r == PS2_BUF_SIZE) {
-            ps2_rx_buf_r = 0;
-        }
-    }
-
-    sei(); // Включаем прерывания
-    return data;
-}
-
-//---------------------------------------------------------------------------
-// Вычисление бита чётности
-const uint8_t nibble_parity[16] = {
-    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0
-};
-
-uint8_t parity(uint8_t p) {
-    return nibble_parity[p >> 4] ^ nibble_parity[p & 0x0F];
+    // Очищаем буфер SPI
+    spi_tx_buf_r = spi_tx_buf_w;
+    spi_tx_buf_count = 0;
 }
 
 //---------------------------------------------------------------------------
 // Изменение тактового сигнала PS/2
 ISR (INT1_vect) {
-    if (ps2_state == ps2_state_error) {
+    if (unlikely(ps2_state == ps2_state_error)) {
         return;
     }
 
@@ -313,7 +255,7 @@ ISR (INT1_vect) {
                 DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
                 break;
             case 1: // Подтверждение приёма
-                if (ps2_data()) {
+                if (unlikely(ps2_data_pin())) {
                     ps2_state = ps2_state_error;
                 } else {
                     ps2_state = ps2_state_read; 
@@ -325,23 +267,23 @@ ISR (INT1_vect) {
     } else {
         switch (ps2_bitcount) {
             case 11: // Старт бит
-                if (ps2_data()) {
+                if (unlikely(ps2_data_pin())) {
                     ps2_state = ps2_state_error;
                 }
                 break;
             default: // Данные
                 ps2_data >>= 1;
-                if (ps2_data()) {
+                if (ps2_data_pin()) {
                     ps2_data |= 0x80;
                 }
                 break;
             case 2: // Бит четности 
-                if (parity(ps2_data) != (ps2_data() != 0)) {
+                if (unlikely(__builtin_parity(ps2_data) != (ps2_data_pin() != 0))) {
                     ps2_state = ps2_state_error;
                 }
                 break;
             case 1: // Стоп бит 
-                if (ps2_data()) {
+                if (likely(ps2_data_pin())) {
                     ps2_rx_push(ps2_data);
                 } else {
                     ps2_state = ps2_state_error;
@@ -353,145 +295,14 @@ ISR (INT1_vect) {
 }
 
 //---------------------------------------------------------------------------
-// Инициализация PS/2
-void ps2_init(void) {
-    // Переключаем PS/2 порт на приём
-    DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
-    DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
+ISR (TIMER0_OVF_vect) { // 80.13 Hz
+    TCNT0 = TIMER0_CONST;
 
-    // Очищаем приёмный буфер
-    ps2_rx_buf_w = 0;
-    ps2_rx_buf_r = 0;
-    ps2_rx_buf_count = 0;
-
-    // Устанавливаем переменные обработчика прерывания
-    ps2_state = ps2_state_read;
-    ps2_bitcount = 11;
-
-    // Прерывание по срезу тактового сигнала
-    GIFR = _BV(INTF1);
-    GICR |= _BV(INT1);
-    MCUCR = (MCUCR & 0xFC) | 2;
+    static uint8_t cnt = 0;
+    send_PS2_data_flag = cnt++ & 1;
 }
 
 //---------------------------------------------------------------------------
-// Отправка байта в PS/2 порт без подтверждения
-void ps2_write(uint8_t a) {
-    // Отключаем прерывание по изменению тактового сигнала PS/2
-    GIFR = _BV(INTF1);
-    GICR &= ~_BV(INT1);
-
-    // Замыкаем тактовый сигнал PS/2 на землю
-    PORT(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
-    DDR(PS2_CLK_PORT) |= _BV(PS2_CLK_PIN);
-
-    // ждём в течение 100 мкс
-    _delay_us(100);
-
-    // Замыкаем линию данных PS/2 на землю
-    PORT(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
-    DDR(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN);
-
-    // Освобождаем тактовый сигнал
-    DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
-
-    // Очищаем приёмный буфер
-    ps2_rx_buf_count = 0;
-    ps2_rx_buf_w = 0;
-    ps2_rx_buf_r = 0;
-
-    // Настраиваем переменные обработчика прерывания
-    ps2_state = ps2_state_write;
-    ps2_bitcount = 11;
-    ps2_data = a;             
-    ps2_parity = parity(a);
-
-    // Включаем прерывание по срезу тактового сигнала PS/2
-    GIFR = _BV(INTF1);
-    GICR |= _BV(INT1);
-    MCUCR = (MCUCR & 0xFC) | 2;    
-}
-
-//---------------------------------------------------------------------------
-// Получение байта из PS/2 порта с ожиданием
-uint8_t ps2_recv(void) {
-    while (ps2_rx_buf_count == 0);
-    return ps2_read();
-}
-
-//---------------------------------------------------------------------------
-// Отправка байта в PS/2 порт с подтверждением
-void ps2_send(uint8_t c) {
-    ps2_write(c);
-    if (ps2_recv() != 0xFA) {
-        ps2_state = ps2_state_error;
-    }
-}
-
-// Изменилось состояние линий DTR или RTS
-ISR (INT0_vect) {
-    // Сохраняем состояние в переменную
-    mouse_enabled = get_mouse_power_state();
-
-    // Сохраняем признак сброса
-    mouse_reset = true;
-}
-
-//===========================================================================
-// Soft SPI порт
-//===========================================================================
-// Инициализация Soft SPI
-void spi_init(void) {
-    // Установка начальных состояний
-    spi_tx_buf_w = 0;
-    spi_tx_buf_r = 0;
-    spi_tx_buf_count = 0;
-    spi_state_machine = 0;
-    spi_busy = 0;
-
-    spi_sck_low();    // SCK низкий
-    spi_mosi_low();   // MOSI низкий
-    spi_reset_low();  // Reset низкий
-
-    mouse_enabled = get_mouse_power_state();
-    if (mouse_enabled) {
-        mouse_reset = true;
-    }
-}
-
-//---------------------------------------------------------------------------
-// Проверка готовности порта для приёма
-bool ready2receive(void) {
-    if (opt_irq_settings == USE_IRQ4) {
-        return !get_IRQ4_state();
-    }
-    if (opt_irq_settings == USE_IRQ3) {
-        return !get_IRQ3_state();
-    }
-    if (opt_irq_settings == USE_IRQX) {
-        return !get_IRQX_state();
-    }
-
-    return true;
-}
-
-//---------------------------------------------------------------------------
-// Отправка данных через SPI
-void spi_send(uint8_t c) {
-    while (spi_tx_buf_count == SPI_TX_BUFFER_SIZE) ; // Ждём, если буфер передачи полон
-
-    cli(); // не допускаем конфликтов, эти переменные могут изменяться в прерывании
-    spi_tx_buf[spi_tx_buf_w] = c;
-    if (spi_tx_buf_count++ == 0) {
-        if (!spi_busy) // если spi бездействует, запускаем передачу
-            spi_timer_slow();
-    }
-    sei();
-    if (++spi_tx_buf_w == SPI_TX_BUFFER_SIZE) {
-        spi_tx_buf_w = 0;
-    }
-}
-
 // Обработчик прерывания таймера
 ISR(TIMER1_COMPA_vect) {
     static uint8_t current_byte;
@@ -499,13 +310,16 @@ ISR(TIMER1_COMPA_vect) {
 
     switch (spi_state_machine) {
         case 0: 
-                if (!ready2receive() && device_init)
+                if (likely(!ready2receive() && device_init))
+                                                         break;
+                if (unlikely(!spi_tx_buf_count))
                                                  break;
+
                 device_init = 1;
                 spi_busy = 1;
                 current_byte = spi_tx_buf[spi_tx_buf_r];
                 current_bit = 7;
-                if (++spi_tx_buf_r == SPI_TX_BUFFER_SIZE) {
+                if (unlikely(++spi_tx_buf_r == SPI_TX_BUFFER_SIZE)) {
                     spi_tx_buf_r = 0;
                 }
                 spi_tx_buf_count--;
@@ -538,7 +352,7 @@ ISR(TIMER1_COMPA_vect) {
                 break;
 
         case 16: // Конец передачи
-                if (!spi_tx_buf_count) { // Буфер пуст
+                if (likely(!spi_tx_buf_count)) { // Буфер пуст
                     spi_timer_stop(); // остановить таймер
                     spi_busy = 0;
                 } else {
@@ -554,6 +368,230 @@ ISR(TIMER1_COMPA_vect) {
     }
 }
 
+//---------------------------------------------------------------------------
+// Выключение светодиода через некоторое время
+ISR (TIMER2_OVF_vect) {
+    TCCR2 = 0; // Стоп таймер
+
+    led_off();
+}
+
+//---------------------------------------------------------------------------
+// Включаем прерывание по спаду тактового сигнала PS/2
+static inline void enable_ps2_falling_int(void) {
+    GIFR = _BV(INTF1);
+    GICR |= _BV(INT1);
+    MCUCR = (MCUCR & 0xFC) | 0x02;
+}
+
+//---------------------------------------------------------------------------
+// Чтение джамперов
+uint8_t readCOMsettings(void) {
+    register bool tmp = false;
+    if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 0) &&
+        ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 1))
+            return SELECT_COM2;
+    if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 1) &&
+        ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0))
+            return SELECT_COM4;
+
+    // Перемычки на землю не обнаружены, проверяем перемычу между джамперами
+    DDR(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);    // COM_SEL1 теперь выход
+    PORT(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);  // Запишем туда 0
+    tmp = ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0);
+    DDR(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);   // COM_SEL1 теперь вход
+    PORT(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);   // Вернём подтяжку
+
+    return tmp?SELECT_COM3:SELECT_COM1;
+}
+
+bool readWheelsettings(void) {
+    return ((PIN(WHEEL_SEL_PORT) & _BV(WHEEL_SEL_PIN)) == 0)?true:false;
+}
+
+uint8_t readDutysettings(void) {
+    if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 0) &&
+        ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 1))
+            return DUTY_50;
+    if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 1) &&
+        ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 0))
+            return DUTY_75;
+    return DUTY_100;
+}
+
+uint8_t readRatesettings(void) {
+    if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 0) &&
+        ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 1))
+            return PS2_SAMPLES_PER_SEC_SLOW;
+    if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 1) &&
+        ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 0))
+            return PS2_SAMPLES_PER_SEC_MID;
+    return PS2_SAMPLES_PER_SEC_FAST;
+}
+
+//---------------------------------------------------------------------------
+// Сохранить принятый байт в буфер приёма PS/2 порта. Вызывается только из обработчика прерывания.
+void ps2_rx_push(uint8_t c) {
+    // Если буфер переполнен и потерян байт, то программа не сможет правильно 
+    // расшифровать все дальнейшие пакеты, поэтому перезагружаем контроллер.
+    if (unlikely(ps2_rx_buf_count >= PS2_BUF_SIZE)) {
+        ps2_state = ps2_state_error;
+        return;
+    }
+    // Сохраняем в буфер
+    ps2_rx_buf[ps2_rx_buf_w] = c;
+    ps2_rx_buf_count++;
+    if (unlikely(++ps2_rx_buf_w == PS2_BUF_SIZE)) {
+        ps2_rx_buf_w = 0;
+    }
+}
+
+//---------------------------------------------------------------------------
+// Получить байт из приёмного буфера PS/2 порта
+uint8_t ps2_read(void) {
+    register uint8_t data;
+    
+    // Выключаем прерывания, так как обработчик прерывания тоже модифицирует эти переменные.
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        // Если буфер пуст, возвращаем ноль
+        if (ps2_rx_buf_count == 0) {
+            data = 0;
+        } else {
+            // Читаем байт из буфера
+            data = ps2_rx_buf[ps2_rx_buf_r];
+            ps2_rx_buf_count--;
+            if (unlikely(++ps2_rx_buf_r == PS2_BUF_SIZE)) {
+                ps2_rx_buf_r = 0;
+            }
+        }
+    }
+    return data;
+}
+
+//---------------------------------------------------------------------------
+// Инициализация PS/2
+void ps2_init(void) {
+    // Очищаем приёмный буфер
+    ps2_rx_buf_w = 0;
+    ps2_rx_buf_r = 0;
+    ps2_rx_buf_count = 0;
+
+    // Устанавливаем переменные обработчика прерывания
+    ps2_state = ps2_state_read;
+    ps2_bitcount = 11;
+
+    // Прерывание по срезу тактового сигнала
+    enable_ps2_falling_int();
+}
+
+//---------------------------------------------------------------------------
+// Отправка байта в PS/2 порт без подтверждения
+void ps2_write(uint8_t a) {
+    // Отключаем прерывание по изменению тактового сигнала PS/2
+    GIFR = _BV(INTF1);
+    GICR &= ~_BV(INT1);
+
+    // Замыкаем тактовый сигнал PS/2 на землю
+    PORT(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
+    DDR(PS2_CLK_PORT) |= _BV(PS2_CLK_PIN);
+
+    // ждём в течение 100 мкс
+    _delay_us(100);
+
+    // Замыкаем линию данных PS/2 на землю
+    PORT(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
+    DDR(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN);
+
+    // Освобождаем тактовый сигнал
+    DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);
+
+    // Очищаем приёмный буфер
+    ps2_rx_buf_count = 0;
+    ps2_rx_buf_w = 0;
+    ps2_rx_buf_r = 0;
+
+    // Настраиваем переменные обработчика прерывания
+    ps2_state = ps2_state_write;
+    ps2_bitcount = 11;
+    ps2_data = a;             
+    ps2_parity = __builtin_parity(a);
+
+    enable_ps2_falling_int();
+}
+
+//---------------------------------------------------------------------------
+// Получение байта из PS/2 порта с ожиданием
+uint8_t ps2_recv(void) {
+    while (likely(ps2_rx_buf_count == 0));
+    return ps2_read();
+}
+
+//---------------------------------------------------------------------------
+// Отправка байта в PS/2 порт с подтверждением
+void ps2_send(uint8_t c) {
+    ps2_write(c);
+    if (unlikely(ps2_recv() != 0xFA)) {
+        ps2_state = ps2_state_error;
+    }
+}
+
+//===========================================================================
+// Soft SPI порт
+//===========================================================================
+// Инициализация Soft SPI
+void spi_init(void) {
+    spi_reset_high(); // Сброс подсистемы SPI CPLD
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        // Установка начальных состояний
+        spi_tx_buf_w = 0;
+        spi_tx_buf_r = 0;
+        spi_tx_buf_count = 0;
+        spi_state_machine = 0;
+        spi_busy = 0;
+
+        // CPLD сброшен, требуется передача байта конфигурации
+        device_init = false;
+
+        spi_reset_low();  // CPLD активен
+        spi_sck_low();    // SCK низкий
+        spi_mosi_low();   // MOSI низкий
+
+        mouse_enabled = get_mouse_power_state();
+        mouse_reset = true;
+    }
+}
+
+//---------------------------------------------------------------------------
+// Проверка готовности порта для приёма
+bool ready2receive(void) {
+    static const uint8_t irq_pins[] = {IRQ4_PIN, IRQ3_PIN, IRQX_PIN};
+    if (opt_irq_settings >= 1 && opt_irq_settings <= 3) {
+        return !(PIN(ADC_PORT) & _BV(irq_pins[opt_irq_settings - 1]));
+    }
+
+    ps2_state = ps2_state_error;
+    return true;
+}
+
+//---------------------------------------------------------------------------
+// Отправка данных через SPI
+void spi_send(uint8_t c) {
+    while (unlikely(spi_tx_buf_count == SPI_TX_BUFFER_SIZE)) ; // Ждём, если буфер передачи полон
+
+    // не допускаем конфликтов, эти переменные могут изменяться в прерывании
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        spi_tx_buf[spi_tx_buf_w] = c;
+        if (spi_tx_buf_count++ == 0) {
+            if (!spi_busy) // если spi бездействует, запускаем передачу
+                spi_timer_slow();
+        }
+        if (unlikely(++spi_tx_buf_w == SPI_TX_BUFFER_SIZE)) {
+            spi_tx_buf_w = 0;
+        }
+    }
+}
+
+//---------------------------------------------------------------------------
 // Отправка конфигурации устройства через SPI
 void spi_send_config(uint8_t opt_com, uint8_t opt_irq) {
     uint8_t config_data = 0;
@@ -566,49 +604,46 @@ void spi_send_config(uint8_t opt_com, uint8_t opt_irq) {
 //  Управление светодиодом
 //===========================================================================
 // Включить светодиод
-void flash_led() {
-    led_enable();
+static inline void flash_led() {
+    led_on();
     TCNT2 = 0x7F;
     TCCR2 = _BV(CS22)|_BV(CS21)|_BV(CS20); // делитель на 1024
-}
-
-//---------------------------------------------------------------------------
-// Выключение светодиода через некоторое время
-ISR (TIMER2_OVF_vect) {
-    TCCR2 = 0; // Стоп таймер
-    led_disable();
 }
 
 //===========================================================================
 // PS/2 мышь
 //===========================================================================
-
-//---------------------------------------------------------------------------
 // Инициализация PS/2 мыши
-static void ps2m_init() {
-    const uint8_t wheel_sequence[] = {0xF3, 0xC8, 0xF3, 0x64, 0xF3, 0x50, 0xF2};
-
-    // Посылаем команду "Сброс"
-    ps2_send(0xFF);
-    if (ps2_recv() != 0xAA) { 
-        ps2_state = ps2_state_error; 
-        return; 
+static void ps2m_init(void) {
+    register uint8_t id;
+    ps2_send(0xFF); // Reset
+    if (ps2_recv() != 0xAA || ps2_recv() != 0x00) {
+        ps2_state = ps2_state_error;
+        return;
     }
-    if (ps2_recv() != 0x00) { 
-        ps2_state = ps2_state_error; 
-        return; 
+
+    ps2_send(0xF2); // Get ID
+    id = ps2_recv();
+    if (id == 0x00 || id == 0x02) {
+        mouse_protocol = PROTOCOL_MICROSOFT;
+        ps2m_wheel = 0;
+    } else {
+        // Попробуем включить колесо
+        ps2_send(0xF3); ps2_send(200); // Sample rate 200
+        ps2_send(0xF3); ps2_send(100);
+        ps2_send(0xF3); ps2_send(80);
+        ps2_send(0xF2); // Get ID again
+        id = ps2_recv();
+        if (id == 0x03 || id == 0x04) {
+            mouse_protocol = PROTOCOL_MICROSOFT;
+        } else {
+            // Вариант EM84520 — если нет ID или ID неизвестен
+            mouse_protocol = PROTOCOL_EM84520;
+        }
+        ps2m_wheel = opt_wheel_enabled?1:0; // Есть колесо
     }
 
     flash_led(); // Мышь инициализирована
-
-    if (opt_wheel_enabled) {
-        // Включаем колесо и побочно устанавливаем 80 пакетов в секунду.
-        for (uint8_t i = 0; i < sizeof(wheel_sequence);++i) {
-            ps2_send(wheel_sequence[i]);
-        }
-        
-        ps2m_wheel = ps2_recv(); // Узнаём, получилось ли включить колесо
-    }
 
     // Разрешение 8 точек на мм
     ps2_send(0xE8);
@@ -625,9 +660,7 @@ static void ps2m_init() {
 //---------------------------------------------------------------------------
 // Обработка поступивших с PS/2 порта данных
 void ps2m_process() {
-//    while (ps2_rx_buf_count < (3 + (ps2m_wheel ? 1 : 0))) {
-//    }
-    while (ps2_rx_buf_count >= (3 + (ps2m_wheel ? 1 : 0))) {
+    while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
         ps2m_b = ps2_read() & 7; //! Тут старшие биты!!!
         ps2m_x += (int8_t)ps2_read();
         ps2m_y -= (int8_t)ps2_read();
@@ -637,25 +670,17 @@ void ps2m_process() {
     }
 }
 
-//---------------------------------------------------------------------------
-ISR (TIMER0_OVF_vect) { // 80.13 Hz
-    TCNT0 = TIMER0_CONST;
-
-    static uint8_t cnt = 0;
-    send_PS2_data_flag = cnt++ & 1;
-}
-
 //===========================================================================
 // Интерфейс с компьютером
 //===========================================================================
 //---------------------------------------------------------------------------
 // Отправка данных мыши через SPI
 void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
-    uint8_t lb, rb, mb;
+    register uint8_t lb, rb, mb;
     static uint8_t mb1;
 
     // Обработка сброса      
-    if (mouse_reset) {
+    if (unlikely(mouse_reset)) {
         mouse_reset = false; 
         _delay_ms(14);
         if (mouse_protocol == PROTOCOL_EM84520) {
@@ -696,12 +721,35 @@ void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
 }
 
 //===========================================================================
-// Программа
+// Инициализация и тело программы
 //===========================================================================
+static inline uint16_t adc_read(uint8_t channel) {
+    ADMUX = (ADMUX & 0xF0) | (channel & 0x0F);
+    ADCSRA |= _BV(ADSC);
+    while (likely(ADCSRA & _BV(ADSC))) ;
+    return ADC;
+}
 
-static void init(void) {
-// Настройка портов ввода-вывода и подтягивающих резисторов
 //---------------------------------------------------------------------------
+uint8_t checkIRQ(uint8_t opt_com) {
+    PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
+    _delay_us(5); // ждём стабилизацию уровня
+    uint16_t tmp = adc_read(IRQX_PIN);
+    PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
+
+    // Определяем используется ли прерывание IRQX (джампер опускает напряжение к 0)
+    if (tmp > IRQX_threshold) { // Напряжение на выводе IRQ выше заданного значения
+        if (opt_com == SELECT_COM1 || opt_com == SELECT_COM3) {
+            return USE_IRQ4;
+        }
+        return USE_IRQ3;
+    }
+
+    return USE_IRQX;
+}
+
+//---------------------------------------------------------------------------
+static void init(void) {
 // Port B
     DDR(DUTY_SEL1_PORT) &= ~_BV(DUTY_SEL1_PIN);  // pin 12 (PB0) вход duty 75%
     PORT(DUTY_SEL1_PORT) |= _BV(DUTY_SEL1_PIN);  // Подтяжка на PB0
@@ -791,7 +839,7 @@ static void init(void) {
     // Расчет значения для сравнения (2mks)
     // Необходимое количество тактов = Время / Период_такта
     // 2mks / 125ns = 2000mks / 125ns = 16 тактов
-    OCR1A = 15;  // 0-15 = 16 тактов
+    OCR1A = TIMER1_CONST;  // 0-15 = 16 тактов
 
     // Таймер 2
     // Clock source: System Clock (8 MHZ)
@@ -819,10 +867,15 @@ static void init(void) {
     ADMUX = (0 << REFS1) | (0 << REFS0); // Vref = AVCC
     ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS0);  // Включить ADC, делитель 32
 
+    // Определяем конфигурацию джамперов
+    opt_com_settings = readCOMsettings();
+    opt_wheel_enabled = readWheelsettings();
+    opt_duty_settings = readDutysettings();
+    opt_rate_settings = readRatesettings();
+    opt_irq_settings = checkIRQ(opt_com_settings);
+
     // Настройка Watchdog-таймера
     wdt_enable(WDTO_1S);
-
-    device_init = false;
 
     // Включение прерываний
     sei();
@@ -838,7 +891,7 @@ static void sentToSpi() {
     send_PS2_data_flag = false;
     dr_ctr = (dr_ctr + 1) & 0x03;
 
-    if (dr_ctr > opt_duty_settings) { // пропускаем 0, 1 или 2 такта из 4
+    if (likely(dr_ctr > opt_duty_settings)) { // пропускаем 0, 1 или 2 такта из 4
         if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
             int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
             ps2m_x -= cx;
@@ -854,42 +907,8 @@ static void sentToSpi() {
     }
 }
 
-static void checkJumpers() {
-    opt_com_settings = readCOMsettings();
-    opt_wheel_enabled = readWheelsettings();
-    opt_duty_settings = readDutysettings();
-    opt_rate_settings = readRatesettings();
-}
-
-// Чтение ADC канала
-uint16_t adc_read(uint8_t channel) {
-    ADMUX = (ADMUX & 0xF0) | (channel & 0x0F);
-    ADCSRA |= _BV(ADSC);
-    while (ADCSRA & _BV(ADSC)) ;
-    return ADC;
-}
-
-uint8_t checkIRQ(uint8_t opt_com) {
-    PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
-    _delay_us(5); // ждём стабилизацию уровня
-    uint16_t tmp = adc_read(IRQX_PIN);
-    PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
-
-    // Определяем используется ли прерывание IRQX (джампер опускает напряжение к 0)
-    if (tmp > IRQX_threshold) { // Напряжение на выводе IRQ выше заданного значения
-        if (opt_com == SELECT_COM1 || opt_com == SELECT_COM3) {
-            return USE_IRQ4;
-        }
-        return USE_IRQ3;
-    }
-
-    return USE_IRQX;
-}
-
 int main(void) {
     init();
-    checkJumpers(); // Определяем конфигурацию джамперов
-    opt_irq_settings = checkIRQ(opt_com_settings);
 
     spi_init();  // Инициализация SPI вместо UART
     spi_send_config(opt_com_settings, opt_irq_settings);
@@ -898,11 +917,19 @@ int main(void) {
     ps2m_init();
 
     for(;;) {
-        if (ps2_state != ps2_state_error) {
+        if (likely(ps2_state != ps2_state_error)) {
             wdt_reset();
         }
 
         ps2m_process();
         sentToSpi();
+
+        // Усыпляем процессор, если нет данных для обработки
+        if (likely(!send_PS2_data_flag && !ps2_rx_buf_count && !spi_tx_buf_count)) {
+            set_sleep_mode(SLEEP_MODE_IDLE);
+            sleep_enable();
+            sleep_cpu();
+            sleep_disable();
+        }
     }
 }

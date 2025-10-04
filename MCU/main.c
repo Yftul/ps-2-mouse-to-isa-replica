@@ -691,6 +691,8 @@ void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
             mb1 = mb;
         }
     }
+
+    flash_led();
 }
 
 //===========================================================================
@@ -868,11 +870,9 @@ uint16_t adc_read(uint8_t channel) {
 }
 
 uint8_t checkIRQ(uint8_t opt_com) {
-    uint16_t tmp;
-
     PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
     _delay_us(5); // ждём стабилизацию уровня
-    tmp = adc_read(IRQX_PIN);
+    uint16_t tmp = adc_read(IRQX_PIN);
     PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
 
     // Определяем используется ли прерывание IRQX (джампер опускает напряжение к 0)

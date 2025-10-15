@@ -57,8 +57,8 @@ architecture Behavioral of uart_isa is
     type base_addr_array_t is array (0 to 3) of std_logic_vector(6 downto 0);
     constant BASE_ADDR_ROM : base_addr_array_t := (
         0 => "1111111", -- COM1 = 0x3F8 >> 3 = 0x7F
-        1 => "1111101", -- COM2 = 0x3E8 >> 3 = 0x7D
-        2 => "1011111", -- COM3 = 0x2F8 >> 3 = 0x5F
+        1 => "1011111", -- COM2 = 0x2F8 >> 3 = 0x5F
+        2 => "1111101", -- COM3 = 0x3E8 >> 3 = 0x7D
         3 => "1011101"  -- COM4 = 0x2E8 >> 3 = 0x5D
 );
 begin
@@ -98,7 +98,8 @@ begin
                             else -- Loop mode
                                 data_out <= mdm_ctl_reg(3) & mdm_ctl_reg(2) & mdm_ctl_reg(0) & mdm_ctl_reg(1) & "0000"; -- OUT2 & OUT1 & DTR & RTS 
                             end if;
-                        when others => null;
+--                        when others => null;
+                        when others => data_out <= "01010011"; -- Тестовое значение, для быстрого определения работоспособности
                     end case;
                 end if;
             end if;

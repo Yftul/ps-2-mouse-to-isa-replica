@@ -278,7 +278,7 @@ ISR (INT1_vect) {
                 }
                 break;
             case 2: // Бит четности 
-                if (unlikely(__builtin_parity(ps2_data) != (ps2_data_pin() != 0))) {
+                if (unlikely(!__builtin_parity(ps2_data) != (ps2_data_pin() != 0))) {
                     ps2_state = ps2_state_error;
                 }
                 break;
@@ -388,11 +388,11 @@ static inline void enable_ps2_falling_int(void) {
 // Чтение джамперов
 uint8_t readCOMsettings(void) {
     register bool tmp = false;
-    if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 0) &&
-        ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 1))
+    if (!((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN))) &&
+        ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN))))
             return SELECT_COM2;
-    if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN)) == 1) &&
-        ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0))
+    if (((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN))) &&
+        !((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN))))
             return SELECT_COM4;
 
     // Перемычки на землю не обнаружены, проверяем перемычу между джамперами
@@ -410,21 +410,21 @@ bool readWheelsettings(void) {
 }
 
 uint8_t readDutysettings(void) {
-    if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 0) &&
-        ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 1))
+    if (!((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN))) &&
+        ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN))))
             return DUTY_50;
-    if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN)) == 1) &&
-        ((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN)) == 0))
+    if (((PIN(DUTY_SEL1_PORT) & _BV(DUTY_SEL1_PIN))) &&
+        !((PIN(DUTY_SEL2_PORT) & _BV(DUTY_SEL2_PIN))))
             return DUTY_75;
     return DUTY_100;
 }
 
 uint8_t readRatesettings(void) {
-    if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 0) &&
-        ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 1))
+    if (!((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN))) &&
+        ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN))))
             return PS2_SAMPLES_PER_SEC_SLOW;
-    if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN)) == 1) &&
-        ((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN)) == 0))
+    if (((PIN(RATE_SEL1_PORT) & _BV(RATE_SEL1_PIN))) &&
+        !((PIN(RATE_SEL2_PORT) & _BV(RATE_SEL2_PIN))))
             return PS2_SAMPLES_PER_SEC_MID;
     return PS2_SAMPLES_PER_SEC_FAST;
 }
@@ -514,7 +514,7 @@ void ps2_write(uint8_t a) {
     ps2_state = ps2_state_write;
     ps2_bitcount = 11;
     ps2_data = a;             
-    ps2_parity = __builtin_parity(a);
+    ps2_parity = !__builtin_parity(a);
 
     enable_ps2_falling_int();
 }
@@ -617,9 +617,13 @@ static inline void flash_led() {
 static void ps2m_init(void) {
     register uint8_t id;
     ps2_send(0xFF); // Reset
-    if (ps2_recv() != 0xAA || ps2_recv() != 0x00) {
-        ps2_state = ps2_state_error;
-        return;
+    if (ps2_recv() != 0xAA) { 
+        ps2_state = ps2_state_error; 
+        return; 
+    }
+    if (ps2_recv() != 0x00) { 
+        ps2_state = ps2_state_error; 
+        return; 
     }
 
     ps2_send(0xF2); // Get ID
@@ -723,6 +727,13 @@ void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
 //===========================================================================
 // Инициализация и тело программы
 //===========================================================================
+static inline uint8_t get_reset_source(void) {
+    uint8_t cause = MCUSR; // читаем причину
+    MCUSR = 0;             // сбрасываем все флаги, чтобы не влияли на будущее
+    return cause;
+}
+
+//---------------------------------------------------------------------------
 static inline uint16_t adc_read(uint8_t channel) {
     ADMUX = (ADMUX & 0xF0) | (channel & 0x0F);
     ADCSRA |= _BV(ADSC);
@@ -873,6 +884,17 @@ static void init(void) {
     opt_duty_settings = readDutysettings();
     opt_rate_settings = readRatesettings();
     opt_irq_settings = checkIRQ(opt_com_settings);
+
+    switch(get_reset_source()) {
+        case _BV(PORF): // Power-on reset
+        case _BV(BORF): // Brown-out reset
+        case _BV(WDRF): // Watchdog reset
+            break;
+        case _BV(EXTRF): // External reset
+            led_on();
+            _delay_ms(100); // Сигнализируем исправность светодиода
+            led_off();
+    }
 
     // Настройка Watchdog-таймера
     wdt_enable(WDTO_1S);

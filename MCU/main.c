@@ -20,6 +20,7 @@
 
 #define TIMER0_CONST 0x9F // Регулирует скорость передачи данных мыши
 #define TIMER1_CONST 0x0F // Регулирует битовую скорость передачи SPI
+#define TIMER2_CONST 0x7F // Регулирует длительность послесвечения светодиода
 
 #define GLUE(a, b)     a##b
 
@@ -606,7 +607,7 @@ void spi_send_config(uint8_t opt_com, uint8_t opt_irq) {
 // Включить светодиод
 static inline void flash_led() {
     led_on();
-    TCNT2 = 0x7F;
+    TCNT2 = TIMER2_CONST;
     TCCR2 = _BV(CS22)|_BV(CS21)|_BV(CS20); // делитель на 1024
 }
 
@@ -856,7 +857,7 @@ static void init(void) {
     // Clock source: System Clock (8 MHZ)
     ASSR = 0; 
     TCCR2 = _BV(CS22)|_BV(CS21)|_BV(CS20); // CLK/1024
-    TCNT2 = 0x7F;
+    TCNT2 = TIMER2_CONST;
     OCR2 = 0;
 
     // Включение прерывания по изменению на входе INT0 - детектирование включения питания мыши

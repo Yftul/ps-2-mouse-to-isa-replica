@@ -19,7 +19,7 @@
 #define SPI_TX_BUFFER_SIZE 256 // Размер буфера передачи SPI
 
 #define TIMER0_CONST 0x9F // Регулирует скорость передачи данных мыши
-#define TIMER1_CONST 0x0F // Регулирует битовую скорость передачи SPI
+#define TIMER1_CONST 0x4F // Регулирует битовую скорость передачи SPI
 #define TIMER2_CONST 0x7F // Регулирует длительность послесвечения светодиода
 
 #define GLUE(a, b)     a##b
@@ -382,7 +382,7 @@ ISR (TIMER2_OVF_vect) {
 static inline void enable_ps2_falling_int(void) {
     GIFR = _BV(INTF1);
     GICR |= _BV(INT1);
-    MCUCR = (MCUCR & 0xFC) | 0x02;
+    MCUCR = (MCUCR & 0xF3) | _BV(ISC11);
 }
 
 //---------------------------------------------------------------------------
@@ -785,7 +785,8 @@ static void init(void) {
     PORTB |= _BV(6);  // PB6 = 1
 
     DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);  // pin 8  (PB7) как вход (Mouse data)
-    PORT(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN); // Отключить подтяжку PB7
+    PORT(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN);  // Включить подтяжку PB7(DATA)
+//    PORT(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN); // Отключить подтяжку PB7(DATA)
 
 //---------------------------------------------------------------------------
 // Port C
@@ -822,7 +823,8 @@ static void init(void) {
     PORT(DTR_PORT) |= _BV(DTR_PIN); // Подтяжка на PD2
 
     DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);  // pin 1 (PD3) вход (Mouse clock)
-    PORT(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN); // Отключить подтяжку PD3
+    PORT(PS2_CLK_PORT) |= _BV(PS2_CLK_PIN);  // Включить подтяжку PD3(CLK)
+//    PORT(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN); // Отключить подтяжку PD3(CLK)
 
     DDRD  |= _BV(4);  // pin 2 (PD4) как выход (N/C)
     PORTD |= _BV(4);  // PD4 = 1
@@ -850,8 +852,8 @@ static void init(void) {
     
     // Расчет значения для сравнения (2mks)
     // Необходимое количество тактов = Время / Период_такта
-    // 2mks / 125ns = 2000mks / 125ns = 16 тактов
-    OCR1A = TIMER1_CONST;  // 0-15 = 16 тактов
+    // 2mks / 125ns = 2000mks / 125ns = 16 тактов (0-15)
+    OCR1A = TIMER1_CONST;
 
     // Таймер 2
     // Clock source: System Clock (8 MHZ)
@@ -861,9 +863,9 @@ static void init(void) {
     OCR2 = 0;
 
     // Включение прерывания по изменению на входе INT0 - детектирование включения питания мыши
-    GICR |= _BV(INT0);     // Разрешить прерывание INT0 (PD2)
-    MCUCR = _BV(ISC10);    // Прерывание по любому изменению сигнала
-    GIFR = _BV(INTF0);     // Очистить флаг прерывания (если был установлен раньше)
+    GIFR = _BV(INTF0);  // Очистить флаг прерывания (если был установлен ранее)
+    GICR  = _BV(INT0);  // Разрешить прерывание INT0 (PD2)
+    MCUCR = _BV(ISC00); // Прерывание по любому изменению сигнала
 
     // Timer(s)/Counter(s) Interrupt(s) initialization
     // Включаем прерывания от таймеров 0 и 2

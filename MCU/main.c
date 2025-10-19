@@ -15,8 +15,8 @@
 #include <util/delay.h>
 #include <util/atomic.h>
 
-#define PS2_BUF_SIZE 256       // Размер приёмного буфера PS/2 порта
-#define SPI_TX_BUFFER_SIZE 256 // Размер буфера передачи SPI
+#define PS2_BUF_SIZE 128       // Размер приёмного буфера PS/2 порта
+#define SPI_TX_BUFFER_SIZE 128 // Размер буфера передачи SPI
 
 #define TIMER0_CONST 0x9F // Регулирует скорость передачи данных мыши
 #define TIMER1_CONST 0x4F // Регулирует битовую скорость передачи SPI
@@ -104,6 +104,14 @@
 #define spi_timer_fast()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS10);}
 #define spi_timer_slow()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS12) | (1 << CS10);}
 
+#define SPI_SEND_BIT(bit_mask, tx_byte) \
+    spi_sck_low(); \
+    asm volatile("nop\n\t");\
+    if (tx_byte & (bit_mask)) spi_mosi_high(); else spi_mosi_low(); \
+    asm volatile("nop\n\t");\
+    spi_sck_high();\
+    asm volatile("nop\n\t");
+
 //===========================================================================
 // PS/2
 //===========================================================================
@@ -143,9 +151,9 @@ typedef enum {
 // Select data rate
 //===========================================================================
 // Скорость мыши
-#define PS2_SAMPLES_PER_SEC_FAST    180    // 10..200 
-#define PS2_SAMPLES_PER_SEC_MID     90     // 10..200
-#define PS2_SAMPLES_PER_SEC_SLOW    40     // 10..200
+#define PS2_SAMPLES_PER_SEC_FAST    80 // 10, 20, 40, 60, 80, 100, 200
+#define PS2_SAMPLES_PER_SEC_MID     40 // 10, 20, 40, 60, 80, 100, 200
+#define PS2_SAMPLES_PER_SEC_SLOW    20 // 10, 20, 40, 60, 80, 100, 200
 
 //===========================================================================
 // Глобальные переменные
@@ -184,7 +192,6 @@ volatile uint8_t spi_tx_buf_w;
 volatile uint8_t spi_tx_buf_r;
 volatile uint8_t spi_tx_buf_count;
 volatile uint8_t spi_state_machine;
-volatile uint8_t spi_busy;
 
 volatile bool mouse_reset; // Необходима инициализация мыши
 volatile bool mouse_enabled;
@@ -279,7 +286,7 @@ ISR (INT1_vect) {
                 }
                 break;
             case 2: // Бит четности 
-                if (unlikely(!__builtin_parity(ps2_data) != (ps2_data_pin() != 0))) {
+                if (unlikely(__builtin_parity(ps2_data) == ps2_data_pin())) {
                     ps2_state = ps2_state_error;
                 }
                 break;
@@ -306,66 +313,45 @@ ISR (TIMER0_OVF_vect) { // 80.13 Hz
 //---------------------------------------------------------------------------
 // Обработчик прерывания таймера
 ISR(TIMER1_COMPA_vect) {
-    static uint8_t current_byte;
-    static uint8_t current_bit;
+    // Проверяем возможность передачи
+    if (unlikely(!ready2receive() && device_init)) {
+        spi_timer_slow();
+        return;
+    }
 
-    switch (spi_state_machine) {
-        case 0: 
-                if (likely(!ready2receive() && device_init))
-                                                         break;
-                if (unlikely(!spi_tx_buf_count))
-                                                 break;
+    if (unlikely(!spi_tx_buf_count)) {
+        spi_timer_stop();
+        return;
+    }
+    
+    device_init = 1;
 
-                device_init = 1;
-                spi_busy = 1;
-                current_byte = spi_tx_buf[spi_tx_buf_r];
-                current_bit = 7;
-                if (unlikely(++spi_tx_buf_r == SPI_TX_BUFFER_SIZE)) {
-                    spi_tx_buf_r = 0;
-                }
-                spi_tx_buf_count--;
-                spi_timer_fast(); // Устанавливаем период для передачи данных
-        case 2:
-        case 4:
-        case 6:
-        case 8:
-        case 10:
-        case 12:
-        case 14:
-                spi_sck_low();
-                if (current_byte & (1 << current_bit--))
-                    spi_mosi_high();
-                else 
-                    spi_mosi_low();
-                spi_state_machine++;
-                break;
-
-        case 1:
-        case 3:
-        case 5:
-        case 7:
-        case 9:
-        case 11:
-        case 13:
-        case 15:
-                spi_sck_high();
-                spi_state_machine++;
-                break;
-
-        case 16: // Конец передачи
-                if (likely(!spi_tx_buf_count)) { // Буфер пуст
-                    spi_timer_stop(); // остановить таймер
-                    spi_busy = 0;
-                } else {
-                    spi_timer_slow(); // Устанавливаем период проверки возможности передачи
-                }
-                spi_sck_low();
-                spi_mosi_low();
-                spi_state_machine = 0;
-                break;
-
-        default: // Ошибка, сбрасываем устройство
-                ps2_state = ps2_state_error;
+    // Забираем байт из буфера
+    uint8_t current_byte = spi_tx_buf[spi_tx_buf_r];
+    if (unlikely(++spi_tx_buf_r == SPI_TX_BUFFER_SIZE)) {
+        spi_tx_buf_r = 0;
+    }
+    spi_tx_buf_count--;
+    
+    // Линейная передача всех 8 битов без циклов
+    SPI_SEND_BIT(0x80, current_byte);
+    SPI_SEND_BIT(0x40, current_byte);
+    SPI_SEND_BIT(0x20, current_byte);
+    SPI_SEND_BIT(0x10, current_byte);
+    SPI_SEND_BIT(0x08, current_byte);
+    SPI_SEND_BIT(0x04, current_byte);
+    SPI_SEND_BIT(0x02, current_byte);
+    SPI_SEND_BIT(0x01, current_byte);
+    
+    // Завершение передачи
+    spi_sck_low();
+    spi_mosi_low();
+    
+    // Управление таймером
+    if (likely(!spi_tx_buf_count)) {
+        spi_timer_stop();
+    } else {
+        spi_timer_fast();
     }
 }
 
@@ -548,7 +534,6 @@ void spi_init(void) {
         spi_tx_buf_r = 0;
         spi_tx_buf_count = 0;
         spi_state_machine = 0;
-        spi_busy = 0;
 
         // CPLD сброшен, требуется передача байта конфигурации
         device_init = false;
@@ -582,10 +567,8 @@ void spi_send(uint8_t c) {
     // не допускаем конфликтов, эти переменные могут изменяться в прерывании
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         spi_tx_buf[spi_tx_buf_w] = c;
-        if (spi_tx_buf_count++ == 0) {
-            if (!spi_busy) // если spi бездействует, запускаем передачу
-                spi_timer_slow();
-        }
+        if (spi_tx_buf_count++ == 0)
+                        spi_timer_fast();
         if (unlikely(++spi_tx_buf_w == SPI_TX_BUFFER_SIZE)) {
             spi_tx_buf_w = 0;
         }
@@ -786,7 +769,6 @@ static void init(void) {
 
     DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);  // pin 8  (PB7) как вход (Mouse data)
     PORT(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN);  // Включить подтяжку PB7(DATA)
-//    PORT(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN); // Отключить подтяжку PB7(DATA)
 
 //---------------------------------------------------------------------------
 // Port C
@@ -824,7 +806,6 @@ static void init(void) {
 
     DDR(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN);  // pin 1 (PD3) вход (Mouse clock)
     PORT(PS2_CLK_PORT) |= _BV(PS2_CLK_PIN);  // Включить подтяжку PD3(CLK)
-//    PORT(PS2_CLK_PORT) &= ~_BV(PS2_CLK_PIN); // Отключить подтяжку PD3(CLK)
 
     DDRD  |= _BV(4);  // pin 2 (PD4) как выход (N/C)
     PORTD |= _BV(4);  // PD4 = 1
@@ -889,14 +870,15 @@ static void init(void) {
     opt_irq_settings = checkIRQ(opt_com_settings);
 
     switch(get_reset_source()) {
+        case _BV(EXTRF): // External reset
+                led_on();
+                _delay_ms(100); // Сигнализируем исправность светодиода
+                led_off();
+                break;
+        case _BV(WDRF): // Watchdog reset
         case _BV(PORF): // Power-on reset
         case _BV(BORF): // Brown-out reset
-        case _BV(WDRF): // Watchdog reset
             break;
-        case _BV(EXTRF): // External reset
-            led_on();
-            _delay_ms(100); // Сигнализируем исправность светодиода
-            led_off();
     }
 
     // Настройка Watchdog-таймера
@@ -916,7 +898,7 @@ static void sentToSpi() {
     send_PS2_data_flag = false;
     dr_ctr = (dr_ctr + 1) & 0x03;
 
-    if (likely(dr_ctr > opt_duty_settings)) { // пропускаем 0, 1 или 2 такта из 4
+    if (likely(dr_ctr >= opt_duty_settings)) { // пропускаем 0, 1 или 2 такта из 4
         if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
             int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
             ps2m_x -= cx;

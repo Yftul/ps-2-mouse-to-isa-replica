@@ -50,7 +50,7 @@ architecture Behavioral of uart_isa is
     signal data_out       : std_logic_vector(7 downto 0) := (others => '0'); -- Буфер вывода данных ISA
     signal base_irq_val   : std_logic_vector(1 downto 0) := "00";            -- IRQ по умолчанию после включения
     signal base_addr_val  : std_logic_vector(1 downto 0) := "00";            -- Компорт по умолчанию после включения
-    signal base_addr_rdy  : std_logic := '0'; -- Устройство не готово к обмену по ISA сразу после включения;
+    signal device_rdy     : std_logic := '0'; -- Устройство не готово к обмену по ISA сразу после включения;
     signal recv_data_rdy  : std_logic := '0'; -- Готовность принятых данных;
 
      -- Сигналы адресного компаратора
@@ -148,14 +148,14 @@ begin
 
     process(mcu_clk, mcu_res, bit_counter) begin -- Работа с MCU
         if mcu_res = '1' then        -- Сброс от MCU
-            base_addr_rdy <= '0';    -- Сбрасываем готовность базового адреса устройства
+            device_rdy <= '0';    -- Сбрасываем готовность устройства
             recv_data_rdy <= '0';
         else
             if falling_edge(mcu_clk) and (bit_counter = "000") then -- Верифицируем по спаду
-                if (base_addr_rdy = '0') then -- Первый байт данных от MCU - приходит базовый адрес устройства и номер IRQ
+                if (device_rdy = '0') then -- Первый байт данных от MCU - приходит базовый адрес устройства и номер IRQ
                     base_addr_val(1 downto 0) <= rx_acc_reg(1 downto 0); -- Базовый адрес устройства
                     base_irq_val(1 downto 0) <= rx_acc_reg(3 downto 2); -- IRQ устройства
-                    base_addr_rdy <= '1'; -- Готовность устройства(если не установлено по умолчанию)
+                    device_rdy <= '1'; -- Готовность устройства(если не установлено по умолчанию)
                 else  -- Последующие данные от мыши
                     rx_data_reg <= rx_acc_reg;
                     recv_data_rdy <= '1'; -- Готовность принятых данных
@@ -202,14 +202,14 @@ begin
     mcu_isa_res <= not isa_reset; -- Передача сигнала сброса ISA шины на MCU
     mcu_DTR <= (not mdm_ctl_reg(4)) and (mdm_ctl_reg(0) or mdm_ctl_reg(1)); -- Управление питанием мыши, !LOOP & (DTR | RTS)
 
-    device_select <= '1' when isa_aen = '0' and base_addr_rdy = '1' and 
-                            isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val))) else '0';
+    device_select <= '1' when (isa_aen = '0') and (device_rdy = '1') and 
+                            (isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val)))) else '0';
 
-    isa_data <= data_out when isa_reset = '0' and device_select = '1' and isa_ior = '0' else (others => 'Z');
+    isa_data <= data_out when (isa_reset = '0') and (device_select = '1') and (isa_ior = '0') else (others => 'Z');
 
     IRQ_state <= mdm_ctl_reg(3) and ((RxD_IRQ and RxD_IE) or TxD_IE); -- OUT2 также контролирует прерывания, TxD_IRQ всегда выставлен
-    IRQ4 <= IRQ_state when base_irq_val = "01" else 'Z'; -- COM1/COM3
-    IRQ3 <= IRQ_state when base_irq_val = "10" else 'Z'; -- COM2/COM4
-    IRQX <= IRQ_state when base_irq_val = "11" else 'Z'; -- Custom
+    IRQ4 <= IRQ_state when (base_irq_val = "01") and (device_rdy = '1') else 'Z'; -- COM1/COM3
+    IRQ3 <= IRQ_state when (base_irq_val = "10") and (device_rdy = '1') else 'Z'; -- COM2/COM4
+    IRQX <= IRQ_state when (base_irq_val = "11") and (device_rdy = '1') else 'Z'; -- Custom
 
 end Behavioral;

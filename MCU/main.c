@@ -112,6 +112,16 @@
     spi_sck_high();\
     asm volatile("nop\n\t");
 
+#define SPI_SEND_BYTE(tx_byte) \
+    SPI_SEND_BIT(0x80, tx_byte);\
+    SPI_SEND_BIT(0x40, tx_byte);\
+    SPI_SEND_BIT(0x20, tx_byte);\
+    SPI_SEND_BIT(0x10, tx_byte);\
+    SPI_SEND_BIT(0x08, tx_byte);\
+    SPI_SEND_BIT(0x04, tx_byte);\
+    SPI_SEND_BIT(0x02, tx_byte);\
+    SPI_SEND_BIT(0x01, tx_byte);
+
 //===========================================================================
 // PS/2
 //===========================================================================
@@ -132,7 +142,7 @@ typedef enum {
 // Select UART IRQ
 //===========================================================================
 typedef enum {
-    NO_USE_IRQ = 0,
+    NO_IRQ = 0,
     USE_IRQ4 = 1,
     USE_IRQ3 = 2,
     USE_IRQX = 3,
@@ -181,7 +191,7 @@ volatile uint8_t opt_duty_settings;
 volatile uint8_t opt_rate_settings;
 volatile uint8_t opt_irq_settings;
 
-volatile uint8_t ps2m_wheel; // Используемый протокол: 0=без колеса, 1=с колесом
+volatile bool ps2m_wheel; // Используемый протокол: с колесом или без
 volatile uint8_t ps2m_b; // Нажатые кнопки
 volatile int16_t ps2m_x; // Координаты мыши
 volatile int16_t ps2m_y;
@@ -216,8 +226,8 @@ const uint8_t EM84520_ID[61] = {
 //===========================================================================
 // Декларации функций
 //===========================================================================
-void ps2_rx_push(uint8_t c);
-bool ready2receive(void);
+static inline void ps2_rx_push(uint8_t c);
+static inline bool ready2receive(void);
 
 //===========================================================================
 // Прерывания
@@ -306,13 +316,14 @@ ISR (INT1_vect) {
 ISR (TIMER0_OVF_vect) { // 80.13 Hz
     TCNT0 = TIMER0_CONST;
 
-    static uint8_t cnt = 0;
-    send_PS2_data_flag = cnt++ & 1;
+    send_PS2_data_flag = true;
 }
 
 //---------------------------------------------------------------------------
 // Обработчик прерывания таймера
 ISR(TIMER1_COMPA_vect) {
+    uint8_t current_byte;
+
     // Проверяем возможность передачи
     if (unlikely(!ready2receive() && device_init)) {
         spi_timer_slow();
@@ -327,21 +338,14 @@ ISR(TIMER1_COMPA_vect) {
     device_init = 1;
 
     // Забираем байт из буфера
-    uint8_t current_byte = spi_tx_buf[spi_tx_buf_r];
+    current_byte = spi_tx_buf[spi_tx_buf_r];
     if (unlikely(++spi_tx_buf_r == SPI_TX_BUFFER_SIZE)) {
         spi_tx_buf_r = 0;
     }
     spi_tx_buf_count--;
     
-    // Линейная передача всех 8 битов без циклов
-    SPI_SEND_BIT(0x80, current_byte);
-    SPI_SEND_BIT(0x40, current_byte);
-    SPI_SEND_BIT(0x20, current_byte);
-    SPI_SEND_BIT(0x10, current_byte);
-    SPI_SEND_BIT(0x08, current_byte);
-    SPI_SEND_BIT(0x04, current_byte);
-    SPI_SEND_BIT(0x02, current_byte);
-    SPI_SEND_BIT(0x01, current_byte);
+    // Линейная передача без циклов
+    SPI_SEND_BYTE(current_byte);
     
     // Завершение передачи
     spi_sck_low();
@@ -418,7 +422,7 @@ uint8_t readRatesettings(void) {
 
 //---------------------------------------------------------------------------
 // Сохранить принятый байт в буфер приёма PS/2 порта. Вызывается только из обработчика прерывания.
-void ps2_rx_push(uint8_t c) {
+static inline void ps2_rx_push(uint8_t c) {
     // Если буфер переполнен и потерян байт, то программа не сможет правильно 
     // расшифровать все дальнейшие пакеты, поэтому перезагружаем контроллер.
     if (unlikely(ps2_rx_buf_count >= PS2_BUF_SIZE)) {
@@ -549,14 +553,9 @@ void spi_init(void) {
 
 //---------------------------------------------------------------------------
 // Проверка готовности порта для приёма
-bool ready2receive(void) {
-    static const uint8_t irq_pins[] = {IRQ4_PIN, IRQ3_PIN, IRQX_PIN};
-    if (opt_irq_settings >= 1 && opt_irq_settings <= 3) {
-        return !(PIN(ADC_PORT) & _BV(irq_pins[opt_irq_settings - 1]));
-    }
-
-    ps2_state = ps2_state_error;
-    return true;
+static inline bool ready2receive(void) {
+    const uint8_t irq_pins[] = {NO_IRQ, IRQ4_PIN, IRQ3_PIN, IRQX_PIN};
+    return !(PIN(ADC_PORT) & _BV(irq_pins[opt_irq_settings]));
 }
 
 //---------------------------------------------------------------------------
@@ -599,7 +598,6 @@ static inline void flash_led() {
 //===========================================================================
 // Инициализация PS/2 мыши
 static void ps2m_init(void) {
-    register uint8_t id;
     ps2_send(0xFF); // Reset
     if (ps2_recv() != 0xAA) { 
         ps2_state = ps2_state_error; 
@@ -611,24 +609,16 @@ static void ps2m_init(void) {
     }
 
     ps2_send(0xF2); // Get ID
-    id = ps2_recv();
-    if (id == 0x00 || id == 0x02) {
-        mouse_protocol = PROTOCOL_MICROSOFT;
-        ps2m_wheel = 0;
-    } else {
+    ps2_recv();
+    if (opt_wheel_enabled) {
         // Попробуем включить колесо
         ps2_send(0xF3); ps2_send(200); // Sample rate 200
         ps2_send(0xF3); ps2_send(100);
         ps2_send(0xF3); ps2_send(80);
         ps2_send(0xF2); // Get ID again
-        id = ps2_recv();
-        if (id == 0x03 || id == 0x04) {
-            mouse_protocol = PROTOCOL_MICROSOFT;
-        } else {
-            // Вариант EM84520 — если нет ID или ID неизвестен
-            mouse_protocol = PROTOCOL_EM84520;
-        }
-        ps2m_wheel = opt_wheel_enabled?1:0; // Есть колесо
+        ps2m_wheel = ps2_recv();
+    } else {
+        ps2m_wheel = false;
     }
 
     flash_led(); // Мышь инициализирована

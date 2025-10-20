@@ -40,7 +40,7 @@ architecture Behavioral of uart_isa is
     -- Сигналы управления IRQ
     signal SET_RxD_IRQ    : std_logic := '0'; -- сигнал запроса установки RxD_IRQ
     signal RES_RxD_IRQ    : std_logic := '0'; -- сигнал запроса сброса RxD_IRQ
-    signal Enable_IRQ     : std_logic := '0'; -- разрешение использования IRQ
+    signal IRQ_state      : std_logic := '0'; -- текущее состояние IRQ
     signal RxD_IE         : std_logic := '0'; -- разрешение прерывания приема данных
     signal RxD_IRQ        : std_logic := '0'; -- прерывание приема данных
     signal TxD_IE         : std_logic := '0'; -- разрешение прерывания передачи данных
@@ -142,7 +142,7 @@ begin
                 else
                     bit_counter <= bit_counter + 1;
                 end if;
-                 end if;
+            end if;
         end if;
     end process;
 
@@ -164,7 +164,7 @@ begin
         end if;
     end process;
 
-    process(isa_reset, mcu_res, mcu_clk, recv_data_rdy, RxD_IRQ) -- Процесс формирования сигнала установки прерывания
+    process(isa_reset, mcu_res, mcu_clk, recv_data_rdy, bit_counter, RxD_IRQ) -- Процесс формирования сигнала установки прерывания
     begin
 	     if isa_reset = '1' or mcu_res = '1' or RxD_IRQ = '1' then
             SET_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
@@ -200,16 +200,16 @@ begin
 
     -- Комбинаторная логика
     mcu_isa_res <= not isa_reset; -- Передача сигнала сброса ISA шины на MCU
-    mcu_DTR <= mdm_ctl_reg(4) and (mdm_ctl_reg(0) or mdm_ctl_reg(1)); -- Управление питанием мыши, !LOOP & (DTR | RTS)
+    mcu_DTR <= (not mdm_ctl_reg(4)) and (mdm_ctl_reg(0) or mdm_ctl_reg(1)); -- Управление питанием мыши, !LOOP & (DTR | RTS)
 
     device_select <= '1' when isa_aen = '0' and base_addr_rdy = '1' and 
                             isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val))) else '0';
 
     isa_data <= data_out when isa_reset = '0' and device_select = '1' and isa_ior = '0' else (others => 'Z');
 
-    Enable_IRQ <= RxD_IE or mdm_ctl_reg(3); -- OUT2 также разрешает прерывания
-    IRQ4 <= RxD_IRQ when base_irq_val = "01" and Enable_IRQ = '1' else 'Z'; -- COM1/COM3
-    IRQ3 <= RxD_IRQ when base_irq_val = "10" and Enable_IRQ = '1' else 'Z'; -- COM2/COM4
-    IRQX <= RxD_IRQ when base_irq_val = "11" and Enable_IRQ = '1' else 'Z'; -- Custom
+    IRQ_state <= mdm_ctl_reg(3) and ((RxD_IRQ and RxD_IE) or TxD_IE); -- OUT2 также контролирует прерывания, TxD_IRQ всегда выставлен
+    IRQ4 <= IRQ_state when base_irq_val = "01" else 'Z'; -- COM1/COM3
+    IRQ3 <= IRQ_state when base_irq_val = "10" else 'Z'; -- COM2/COM4
+    IRQX <= IRQ_state when base_irq_val = "11" else 'Z'; -- Custom
 
 end Behavioral;

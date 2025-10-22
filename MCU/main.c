@@ -1,15 +1,11 @@
-#include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include <avr/pgmspace.h>
 #include <avr/sleep.h>
-#include <avr/eeprom.h>
 #include <avr/wdt.h>
 
-#define DEBUG 0
 #define F_CPU 8000000UL
 
 #include <util/delay.h>
@@ -80,9 +76,6 @@
 // IRQ
 //===========================================================================
 #define IRQX_threshold 512
-#define get_IRQ4_state() (PIN(ADC_PORT) & _BV(IRQ4_PIN))
-#define get_IRQX_state() (PIN(ADC_PORT) & _BV(IRQX_PIN))
-#define get_IRQ3_state() (PIN(ADC_PORT) & _BV(IRQ3_PIN))
 
 //===========================================================================
 // Светодиод
@@ -150,6 +143,9 @@ typedef enum {
     USE_IRQX = 3,
 } use_irq_t;
 
+static const uint8_t IRQ2PIN[] = {NO_IRQ, IRQ4_PIN, IRQ3_PIN, IRQX_PIN};
+#define not_rdy_2rcv(irq_pin) (PIN(ADC_PORT) & _BV(IRQ2PIN[irq_pin]))
+
 //===========================================================================
 // Select mouse Duty cycles
 //===========================================================================
@@ -185,7 +181,7 @@ volatile uint8_t ps2_rx_buf_w;
 volatile uint8_t ps2_rx_buf_r;
 volatile uint8_t ps2_rx_buf_count;
 
-volatile bool send_PS2_data_flag;
+volatile uint8_t send_PS2_data_flag;
 
 volatile uint8_t opt_com_settings;
 volatile uint8_t opt_wheel_enabled;
@@ -193,9 +189,9 @@ volatile uint8_t opt_duty_settings;
 volatile uint8_t opt_rate_settings;
 volatile uint8_t opt_irq_settings;
 
-volatile bool ps2m_wheel; // Используемый протокол: с колесом или без
-volatile uint8_t ps2m_b; // Нажатые кнопки
-volatile int16_t ps2m_x; // Координаты мыши
+volatile uint8_t ps2m_wheel; // Используемый протокол: с колесом или без
+volatile uint8_t ps2m_b;     // Нажатые кнопки
+volatile int16_t ps2m_x;     // Координаты мыши
 volatile int16_t ps2m_y;
 volatile int16_t ps2m_z;
 
@@ -203,33 +199,53 @@ uint8_t spi_tx_buf[SPI_TX_BUFFER_SIZE];
 volatile uint8_t spi_tx_buf_w;
 volatile uint8_t spi_tx_buf_r;
 volatile uint8_t spi_tx_buf_count;
-volatile uint8_t spi_state_machine;
 
-volatile bool mouse_reset; // Необходима инициализация мыши
-volatile bool mouse_enabled;
-volatile bool device_init; // Произведена инициализация адресов/IRQ устройства
+volatile uint8_t mouse_start; // Необходимо вывести приветствие мыши
+volatile uint8_t mouse_enabled; // Мышь активна
+volatile uint8_t device_init; // Произведена инициализация адресов/IRQ устройства
 
 //===========================================================================
 // Декларации функций
 //===========================================================================
 static inline void ps2_rx_push(uint8_t c);
-static inline bool ready2receive(void);
 void spi_send_config(uint8_t opt_com, uint8_t opt_irq);
+
+//===========================================================================
+// Общие функции
+//===========================================================================
+// Спать
+//---------------------------------------------------------------------------
+static inline void mcu_sleep(void) {
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    sleep_enable();
+    sleep_cpu();
+    sleep_disable();
+}
+
+//---------------------------------------------------------------------------
+// Ограничение переменной значениями [min, max]
+static inline int8_t clamp(int16_t val, int8_t min, int8_t max) {
+    if (val < (int16_t)min) return min;
+    if (val > (int16_t)max) return max;
+    return (int8_t)val;
+}
 
 //===========================================================================
 // Прерывания
 //===========================================================================
 // Изменилось состояние линий DTR или RTS
 ISR (INT0_vect) {
+    // Инициализируем SPI
+    spi_tx_buf_r = spi_tx_buf_w;
+    spi_tx_buf_count = 0;
+    spi_timer_stop();
+
     // Сохраняем состояние в переменную
     mouse_enabled = get_mouse_power_state();
 
-    // Сохраняем признак сброса
-    mouse_reset = true;
-
-    // Очищаем буфер SPI
-    spi_tx_buf_r = spi_tx_buf_w;
-    spi_tx_buf_count = 0;
+    // Устанавливаем признак сброса
+    mouse_start = true;
+    send_PS2_data_flag = true;
 }
 
 //---------------------------------------------------------------------------
@@ -300,7 +316,7 @@ ISR(TIMER1_COMPA_vect) {
     uint8_t current_byte;
 
     // Проверяем возможность передачи
-    if (unlikely(!ready2receive() && device_init)) {
+    if (unlikely(not_rdy_2rcv(opt_irq_settings) && device_init)) {
         spi_timer_slow();
         return;
     }
@@ -353,7 +369,7 @@ static inline void enable_ps2_falling_int(void) {
 //---------------------------------------------------------------------------
 // Чтение джамперов
 uint8_t readCOMsettings(void) {
-    register bool tmp = false;
+    bool tmp = false;
     if (!((PIN(COM_SEL1_PORT) & _BV(COM_SEL1_PIN))) &&
         ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN))))
             return SELECT_COM2;
@@ -364,7 +380,7 @@ uint8_t readCOMsettings(void) {
     // Перемычки на землю не обнаружены, проверяем перемычу между джамперами
     DDR(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);    // COM_SEL1 теперь выход
     PORT(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);  // Запишем туда 0
-    _delay_us(1);                               // Подождём стабилизации сигнала
+    _delay_us(1);                               // Ждём стабилизацию сигнала
     tmp = !(PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN));
     DDR(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);   // COM_SEL1 теперь вход
     PORT(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);   // Вернём подтяжку
@@ -416,7 +432,7 @@ static inline void ps2_rx_push(uint8_t c) {
 //---------------------------------------------------------------------------
 // Получить байт из приёмного буфера PS/2 порта
 uint8_t ps2_read(void) {
-    register uint8_t data;
+    uint8_t data;
     
     // Выключаем прерывания, так как обработчик прерывания тоже модифицирует эти переменные.
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
@@ -489,7 +505,10 @@ void ps2_write(uint8_t a) {
 //---------------------------------------------------------------------------
 // Получение байта из PS/2 порта с ожиданием
 uint8_t ps2_recv(void) {
-    while (likely(!ps2_rx_buf_count)) ;
+    while (likely(!ps2_rx_buf_count)) {
+        mcu_sleep();
+    }
+
     return ps2_read();
 }
 
@@ -513,7 +532,6 @@ void spi_init(void) {
         spi_tx_buf_w = 0;
         spi_tx_buf_r = 0;
         spi_tx_buf_count = 0;
-        spi_state_machine = 0;
 
         // CPLD сброшен, требуется передача байта конфигурации
         device_init = false;
@@ -523,23 +541,18 @@ void spi_init(void) {
         spi_mosi_low();   // MOSI низкий
 
         mouse_enabled = get_mouse_power_state();
-        mouse_reset = true;
+        mouse_start = true;
     }
 
     spi_send_config(opt_com_settings, opt_irq_settings); // Инициализация CPLD
 }
 
 //---------------------------------------------------------------------------
-// Проверка готовности порта для приёма
-static inline bool ready2receive(void) {
-    const uint8_t irq_pins[] = {NO_IRQ, IRQ4_PIN, IRQ3_PIN, IRQX_PIN};
-    return !(PIN(ADC_PORT) & _BV(irq_pins[opt_irq_settings]));
-}
-
-//---------------------------------------------------------------------------
 // Отправка данных через SPI
 void spi_send(uint8_t c) {
-    while (unlikely(spi_tx_buf_count == SPI_TX_BUFFER_SIZE)) ; // Ждём, если буфер передачи полон
+    while (unlikely(spi_tx_buf_count == SPI_TX_BUFFER_SIZE)) { // Ждём, если буфер передачи полон
+        mcu_sleep();
+    } ;
 
     // не допускаем конфликтов, эти переменные могут изменяться в прерывании
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
@@ -611,26 +624,13 @@ static void ps2m_init(void) {
     ps2_send(0xF4);
 }
 
-//---------------------------------------------------------------------------
-// Обработка поступивших с PS/2 порта данных
-void ps2m_process() {
-    while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
-        ps2m_b = ps2_read() & 7; //! Тут старшие биты!!!
-        ps2m_x += (int8_t)ps2_read();
-        ps2m_y -= (int8_t)ps2_read();
-        if (ps2m_wheel) {
-            ps2m_z += (int8_t)ps2_read();
-        }
-    }
-}
-
 //===========================================================================
 // Интерфейс с компьютером
 //===========================================================================
 //---------------------------------------------------------------------------
 // Отправка данных мыши через SPI
 void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
-    register uint8_t lb, rb, mb;
+    uint8_t lb, rb, mb;
 
     // Клавиши мыши
     lb = b & 1;         // левая кнопка
@@ -644,7 +644,7 @@ void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
 
     // Расширенная часть протокола для мыши с колёсиком
     if (ps2m_wheel)
-        spi_send(((mb & 1) << 4) | (z & 0x0F));
+        spi_send((mb << 4) | (z & 0x0F));
 
     flash_led();
 }
@@ -669,7 +669,7 @@ static inline uint16_t adc_read(uint8_t channel) {
 //---------------------------------------------------------------------------
 uint8_t checkIRQ(uint8_t opt_com) {
     PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
-    _delay_us(5); // ждём стабилизацию уровня
+    _delay_us(10); // ждём стабилизацию уровня
     uint16_t tmp = adc_read(IRQX_PIN);
     PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
 
@@ -829,43 +829,10 @@ static void init(void) {
     sei();
 }
 
-//---------------------------------------------------------------------------
-static void sentToSpi() {
-    static uint8_t smb1 = 0;
-    static uint8_t dr_ctr = 0;
-    
-    if (!send_PS2_data_flag || !mouse_enabled) return;
-
-    send_PS2_data_flag = false;
-
-    if (unlikely(mouse_reset)) {
-        mouse_reset = false; 
-
-        _delay_ms(14); // ?
-        // Приветствие Logitech/Microsoft Plus
-        spi_send(0x4D);
-        _delay_ms(63);
-        spi_send(0x33);
-    }
-
-    dr_ctr = (dr_ctr + 1) & 0x03;
-    if (likely(dr_ctr >= opt_duty_settings)) { // пропускаем 0, 1 или 2 такта из 4
-        if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
-            int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
-            ps2m_x -= cx;
-            int8_t cy = ps2m_y < -128 ? -128 : (ps2m_y > 127 ? 127 : ps2m_y); 
-            ps2m_y -= cy;
-            int8_t cz = ps2m_z < -8   ? -8   : (ps2m_z > 7   ?   7 : ps2m_z); 
-            ps2m_z -= cz;
-            
-            smb1 = ps2m_b;
-
-            spi_m_send(cx, cy, cz, ps2m_b);
-        }
-    }
-}
-
 int main(void) {
+    uint8_t smb1 = 0;
+    uint8_t dr_ctr = 0;
+
     init();
 
     spi_init();
@@ -877,15 +844,51 @@ int main(void) {
             wdt_reset();
         }
 
-        ps2m_process();
-        sentToSpi();
+        if (!send_PS2_data_flag || !mouse_enabled) continue;
+        send_PS2_data_flag = false;
+        dr_ctr = (dr_ctr + 1) & 0x03;
+
+        if (unlikely(mouse_start)) {
+            dr_ctr = 0;
+
+            _delay_ms(14);
+            // Приветствие Logitech/Microsoft Plus
+            spi_send(0x4D);
+            _delay_ms(63);
+            spi_send(0x33);
+            mouse_start = false;
+        }
+
+        // Выбираем полностью принятые данные
+        while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
+            ps2m_b = ps2_read() & 7; //! Тут старшие биты!!!
+            ps2m_x += (int8_t)ps2_read();
+            ps2m_y -= (int8_t)ps2_read();
+            if (ps2m_wheel) {
+                ps2m_z += (int8_t)ps2_read();
+            }
+        }
+
+        // пропускаем 0, 1 или 2 такта из 4
+        if (likely(dr_ctr >= opt_duty_settings)) {
+            // Передаём, если что-то изменилось
+            if (ps2m_b != smb1 || ps2m_x || ps2m_y || ps2m_z) {
+                int8_t cx = clamp(ps2m_x, -128, 127);
+                ps2m_x -= cx;
+                int8_t cy = clamp(ps2m_y, -128, 127);
+                ps2m_y -= cy;
+                int8_t cz = clamp(ps2m_z, -8, 7);
+                ps2m_z -= cz;
+
+                smb1 = ps2m_b;
+
+                spi_m_send(cx, cy, cz, ps2m_b);
+            }
+        }
 
         // Усыпляем процессор, если нет данных для обработки
         if (likely(!send_PS2_data_flag && !ps2_rx_buf_count && !spi_tx_buf_count)) {
-            set_sleep_mode(SLEEP_MODE_IDLE);
-            sleep_enable();
-            sleep_cpu();
-            sleep_disable();
+            mcu_sleep();
         }
     }
 }

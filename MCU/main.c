@@ -203,6 +203,7 @@ volatile uint8_t allow_send_data;  // Флаг синхронизации пер
 //===========================================================================
 static inline void ps2_rx_push(uint8_t c);
 void spi_send_config(uint8_t opt_com, uint8_t opt_irq);
+void spi_send(uint8_t c);
 
 //===========================================================================
 // Общие функции
@@ -539,6 +540,8 @@ void spi_init(void) {
     while (!device_init) {
         mcu_sleep();
     }
+    // Начальное значение регистра приёмника
+    spi_send(0x00);
 }
 
 //---------------------------------------------------------------------------
@@ -844,14 +847,16 @@ static inline void do_process(void) {
                 spi_timer_stop();
             }
 
-            ps2_init();
-            ps2m_init();
-
             // Приветствие Logitech/Microsoft Plus
-            _delay_ms(14);
+            _delay_ms(15);
             spi_send(0x4D);
             _delay_ms(63);
             spi_send(0x33);
+
+            // Очистка буфера данных
+            while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
+                for(uint8_t i = 0; i < (ps2m_wheel ? 4 : 3); i++) ps2_read();
+            }
         } else {
             // Выбираем полностью принятые данные
             while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
@@ -886,6 +891,9 @@ static inline void do_process(void) {
 int main(void) {
     init();
     spi_init();
+
+    ps2_init();
+    ps2m_init();
 
     for(;;) {
         if (likely(ps2_state != ps2_state_error)) {

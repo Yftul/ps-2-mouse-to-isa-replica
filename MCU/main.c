@@ -19,7 +19,7 @@
 #define SPI_TX_BUFFER_SIZE 128 // Размер буфера передачи SPI
 
 #define TIMER0_CONST 0x9F // Регулирует скорость передачи данных мыши
-#define TIMER1_CONST 0x4F // Регулирует битовую скорость передачи SPI
+#define TIMER1_CONST 0x4F // Регулирует скорость передачи SPI
 #define TIMER2_CONST 0x7F // Регулирует длительность послесвечения светодиода
 
 #define GLUE(a, b)     a##b
@@ -102,7 +102,7 @@
 
 #define spi_timer_stop()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0;}
 #define spi_timer_fast()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS10);}
-#define spi_timer_slow()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS12) | (1 << CS10);}
+#define spi_timer_slow()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS11);}
 
 #define SPI_SEND_BIT(bit_mask, tx_byte) \
     spi_sck_low(); \
@@ -125,7 +125,9 @@
 //===========================================================================
 // PS/2
 //===========================================================================
-#define ps2_data_pin()          (PIN(PS2_DATA_PORT) & _BV(PS2_DATA_PIN))
+#define ps2_data_in()           (PIN(PS2_DATA_PORT) & _BV(PS2_DATA_PIN))
+#define ps2_data_set_in()       (DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN))
+#define ps2_data_set_out()      (DDR(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN))
 #define get_mouse_power_state() (PIN(DTR_PORT) & _BV(DTR_PIN))
 
 //===========================================================================
@@ -207,27 +209,12 @@ volatile bool mouse_reset; // Необходима инициализация м
 volatile bool mouse_enabled;
 volatile bool device_init; // Произведена инициализация адресов/IRQ устройства
 
-typedef enum {
-    PROTOCOL_MICROSOFT = 0,
-    PROTOCOL_EM84520 = 1,
-} ms_protocols_t;
-
-uint8_t mouse_protocol = PROTOCOL_MICROSOFT; // Используемый протокол: 0=MSMouse, 1=EM84520
-
-const uint8_t EM84520_ID[61] = {
-    0x4D, 0x5A, 0x40, 0x00, 0x00, 0x00, 0x08, 0x01, 0x24, 0x25, 0x2D, 0x23,
-    0x10, 0x10, 0x10, 0x11, 0x3C, 0x3C, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x3C,
-    0x30, 0x2E, 0x30, 0x10, 0x26, 0x10, 0x21, 0x3C, 0x25, 0x2D, 0x23, 0x00,
-    0x33, 0x23, 0x32, 0x2F, 0x2C, 0x2C, 0x29, 0x2E, 0x27, 0x00, 0x33, 0x25,
-    0x32, 0x29, 0x21, 0x2C, 0x00, 0x2D, 0x2F, 0x35, 0x33, 0x25, 0x21, 0x15,
-    0x09
-};
-
 //===========================================================================
 // Декларации функций
 //===========================================================================
 static inline void ps2_rx_push(uint8_t c);
 static inline bool ready2receive(void);
+void spi_send_config(uint8_t opt_com, uint8_t opt_irq);
 
 //===========================================================================
 // Прерывания
@@ -255,29 +242,17 @@ ISR (INT1_vect) {
     if (ps2_state == ps2_state_write) {
         switch (ps2_bitcount) {
             default: // Данные
-                if (ps2_data & 1) {
-                    DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
-                } else {
-                    DDR(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN);
-                }
+                (ps2_data & 1)?ps2_data_set_in():ps2_data_set_out();
                 ps2_data >>= 1;
                 break;
             case 3: // Бит чётности
-                if (ps2_parity) {
-                    DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
-                } else {
-                    DDR(PS2_DATA_PORT) |= _BV(PS2_DATA_PIN);
-                }
+                (ps2_parity)?ps2_data_set_in():ps2_data_set_out();
                 break;
             case 2: // Стоп бит
-                DDR(PS2_DATA_PORT) &= ~_BV(PS2_DATA_PIN);
+                ps2_data_set_in();
                 break;
             case 1: // Подтверждение приёма
-                if (unlikely(ps2_data_pin())) {
-                    ps2_state = ps2_state_error;
-                } else {
-                    ps2_state = ps2_state_read; 
-                }
+                ps2_state = (unlikely(ps2_data_in()))?ps2_state_error:ps2_state_read; 
                 ps2_bitcount = 12;
                 break;
                      
@@ -285,23 +260,23 @@ ISR (INT1_vect) {
     } else {
         switch (ps2_bitcount) {
             case 11: // Старт бит
-                if (unlikely(ps2_data_pin())) {
+                if (unlikely(ps2_data_in())) {
                     ps2_state = ps2_state_error;
                 }
                 break;
             default: // Данные
                 ps2_data >>= 1;
-                if (ps2_data_pin()) {
+                if (ps2_data_in()) {
                     ps2_data |= 0x80;
                 }
                 break;
             case 2: // Бит четности 
-                if (unlikely(__builtin_parity(ps2_data) == ps2_data_pin())) {
+                if (unlikely(__builtin_parity(ps2_data) == ps2_data_in())) {
                     ps2_state = ps2_state_error;
                 }
                 break;
             case 1: // Стоп бит 
-                if (likely(ps2_data_pin())) {
+                if (likely(ps2_data_in())) {
                     ps2_rx_push(ps2_data);
                 } else {
                     ps2_state = ps2_state_error;
@@ -389,7 +364,8 @@ uint8_t readCOMsettings(void) {
     // Перемычки на землю не обнаружены, проверяем перемычу между джамперами
     DDR(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);    // COM_SEL1 теперь выход
     PORT(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);  // Запишем туда 0
-    tmp = ((PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN)) == 0);
+    _delay_us(1);                               // Подождём стабилизации сигнала
+    tmp = !(PIN(COM_SEL2_PORT) & _BV(COM_SEL2_PIN));
     DDR(COM_SEL1_PORT) &= ~_BV(COM_SEL1_PIN);   // COM_SEL1 теперь вход
     PORT(COM_SEL1_PORT) |= _BV(COM_SEL1_PIN);   // Вернём подтяжку
 
@@ -397,7 +373,7 @@ uint8_t readCOMsettings(void) {
 }
 
 bool readWheelsettings(void) {
-    return ((PIN(WHEEL_SEL_PORT) & _BV(WHEEL_SEL_PIN)) == 0)?true:false;
+    return !(PIN(WHEEL_SEL_PORT) & _BV(WHEEL_SEL_PIN));
 }
 
 uint8_t readDutysettings(void) {
@@ -445,7 +421,7 @@ uint8_t ps2_read(void) {
     // Выключаем прерывания, так как обработчик прерывания тоже модифицирует эти переменные.
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         // Если буфер пуст, возвращаем ноль
-        if (ps2_rx_buf_count == 0) {
+        if (!ps2_rx_buf_count) {
             data = 0;
         } else {
             // Читаем байт из буфера
@@ -513,7 +489,7 @@ void ps2_write(uint8_t a) {
 //---------------------------------------------------------------------------
 // Получение байта из PS/2 порта с ожиданием
 uint8_t ps2_recv(void) {
-    while (likely(ps2_rx_buf_count == 0));
+    while (likely(!ps2_rx_buf_count)) ;
     return ps2_read();
 }
 
@@ -549,6 +525,8 @@ void spi_init(void) {
         mouse_enabled = get_mouse_power_state();
         mouse_reset = true;
     }
+
+    spi_send_config(opt_com_settings, opt_irq_settings); // Инициализация CPLD
 }
 
 //---------------------------------------------------------------------------
@@ -608,14 +586,12 @@ static void ps2m_init(void) {
         return; 
     }
 
-    ps2_send(0xF2); // Get ID
-    ps2_recv();
     if (opt_wheel_enabled) {
         // Попробуем включить колесо
         ps2_send(0xF3); ps2_send(200); // Sample rate 200
         ps2_send(0xF3); ps2_send(100);
         ps2_send(0xF3); ps2_send(80);
-        ps2_send(0xF2); // Get ID again
+        ps2_send(0xF2); // Получить ID мыши
         ps2m_wheel = ps2_recv();
     } else {
         ps2m_wheel = false;
@@ -655,45 +631,20 @@ void ps2m_process() {
 // Отправка данных мыши через SPI
 void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
     register uint8_t lb, rb, mb;
-    static uint8_t mb1;
-
-    // Обработка сброса      
-    if (unlikely(mouse_reset)) {
-        mouse_reset = false; 
-        _delay_ms(14);
-        if (mouse_protocol == PROTOCOL_EM84520) {
-            // Приветствие EM84520
-            for (uint8_t i = 0; i < sizeof(EM84520_ID); i++) {
-                spi_send(EM84520_ID[i]);
-            }
-        } else {
-            // Приветствие Logitech/Microsoft Plus
-            spi_send(0x4D);
-            _delay_ms(63);
-            spi_send(0x33);
-        }
-    }
 
     // Клавиши мыши
-    lb = b & 1;
-    rb = (b >> 1) & 1;
-    mb = (b >> 2) & 1;
+    lb = b & 1;         // левая кнопка
+    rb = (b >> 1) & 1;  // правая кнопка
+    mb = (b >> 2) & 1;  // средняя кнопка
 
     // Стандартная часть протокола 
     spi_send((1 << 6) | (lb << 5) | (rb << 4) | ((y & 0xC0) >> 4) | ((x & 0xC0) >> 6));
     spi_send(x & 0x3F);
     spi_send(y & 0x3F);
 
-    if (mouse_protocol == PROTOCOL_EM84520) {
-        // Расширение EM84520
-        spi_send((mb << 4) | (z & 0x0F));
-    } else { 
-        // Расширение Logitech/Microsoft Plus
-        if (mb || mb1) {
-            spi_send(mb << 5);
-            mb1 = mb;
-        }
-    }
+    // Расширенная часть протокола для мыши с колёсиком
+    if (ps2m_wheel)
+        spi_send(((mb & 1) << 4) | (z & 0x0F));
 
     flash_led();
 }
@@ -886,8 +837,18 @@ static void sentToSpi() {
     if (!send_PS2_data_flag || !mouse_enabled) return;
 
     send_PS2_data_flag = false;
-    dr_ctr = (dr_ctr + 1) & 0x03;
 
+    if (unlikely(mouse_reset)) {
+        mouse_reset = false; 
+
+        _delay_ms(14); // ?
+        // Приветствие Logitech/Microsoft Plus
+        spi_send(0x4D);
+        _delay_ms(63);
+        spi_send(0x33);
+    }
+
+    dr_ctr = (dr_ctr + 1) & 0x03;
     if (likely(dr_ctr >= opt_duty_settings)) { // пропускаем 0, 1 или 2 такта из 4
         if (ps2m_b != smb1 || ps2m_x != 0 || ps2m_y != 0 || ps2m_z != 0) {
             int8_t cx = ps2m_x < -128 ? -128 : (ps2m_x > 127 ? 127 : ps2m_x); 
@@ -907,9 +868,7 @@ static void sentToSpi() {
 int main(void) {
     init();
 
-    spi_init();  // Инициализация SPI вместо UART
-    spi_send_config(opt_com_settings, opt_irq_settings);
-
+    spi_init();
     ps2_init();
     ps2m_init();
 

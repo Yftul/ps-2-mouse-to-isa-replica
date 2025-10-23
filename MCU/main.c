@@ -848,10 +848,12 @@ static inline void do_process(void) {
             }
 
             // Приветствие Logitech/Microsoft Plus
-            _delay_ms(15);
+            _delay_ms(10);
+            if (!mouse_enabled)
+                            return;
             spi_send(0x4D);
-            _delay_ms(63);
-            spi_send(0x33);
+//            _delay_ms(63);
+//            spi_send(0x33);
 
             // Очистка буфера данных
             while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {

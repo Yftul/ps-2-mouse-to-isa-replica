@@ -11,6 +11,8 @@
 #include <util/delay.h>
 #include <util/atomic.h>
 
+#define sig_mode sig_RTS_and_DTR
+
 #define PS2_BUF_SIZE 128       // Размер приёмного буфера PS/2 порта
 #define SPI_TX_BUFFER_SIZE 128 // Размер буфера передачи SPI
 
@@ -166,10 +168,17 @@ typedef enum {
 //===========================================================================
 // Глобальные переменные
 //===========================================================================
-enum ps_state_t { 
-    ps2_state_error, 
-    ps2_state_read, 
-    ps2_state_write 
+enum sig_enable_device {
+    sig_RTS = 0,
+    sig_DTR = 1,
+    sig_RTS_or_DTR = 2,
+    sig_RTS_and_DTR = 3
+};
+
+enum ps_state_t {
+    ps2_state_error,
+    ps2_state_read,
+    ps2_state_write
 };
 
 volatile uint8_t ps2m_wheel;
@@ -202,7 +211,7 @@ volatile uint8_t allow_send_data;  // Флаг синхронизации пер
 // Декларации функций
 //===========================================================================
 static inline void ps2_rx_push(uint8_t c);
-void spi_send_config(uint8_t opt_com, uint8_t opt_irq);
+void spi_send_config(uint8_t opt_com, uint8_t opt_irq, uint8_t start_mode);
 void spi_send(uint8_t c);
 
 //===========================================================================
@@ -260,10 +269,10 @@ ISR (INT1_vect) {
                 ps2_data_set_in();
                 break;
             case 1: // Подтверждение приёма
-                ps2_state = (unlikely(ps2_data_in()))?ps2_state_error:ps2_state_read; 
+                ps2_state = (unlikely(ps2_data_in()))?ps2_state_error:ps2_state_read;
                 ps2_bitcount = 12;
                 break;
-        } 
+        }
     } else {
         switch (ps2_bitcount) {
             case 11: // Старт бит
@@ -277,12 +286,12 @@ ISR (INT1_vect) {
                     ps2_data |= 0x80;
                 }
                 break;
-            case 2: // Бит четности 
+            case 2: // Бит четности
                 if (unlikely(__builtin_parity(ps2_data) == ps2_data_in())) {
                     ps2_state = ps2_state_error;
                 }
                 break;
-            case 1: // Стоп бит 
+            case 1: // Стоп бит
                 if (likely(ps2_data_in())) {
                     ps2_rx_push(ps2_data);
                 } else {
@@ -407,7 +416,7 @@ uint8_t readRatesettings(void) {
 //---------------------------------------------------------------------------
 // Сохранить принятый байт в буфер приёма PS/2 порта. Вызывается только из обработчика прерывания.
 static inline void ps2_rx_push(uint8_t c) {
-    // Если буфер переполнен и потерян байт, то программа не сможет правильно 
+    // Если буфер переполнен и потерян байт, то программа не сможет правильно
     // расшифровать все дальнейшие пакеты, поэтому перезагружаем контроллер.
     if (unlikely(ps2_rx_buf_count >= PS2_BUF_SIZE)) {
         ps2_state = ps2_state_error;
@@ -529,14 +538,11 @@ void spi_init(void) {
         spi_sck_low();
         spi_mosi_low();
 
-        mouse_enabled = get_mouse_power_state();
-        mouse_start = true;
-
         spi_reset_low();  // CPLD активен
     }
 
     // Инициализация порта и IRQ
-    spi_send_config(opt_com_settings, opt_irq_settings);
+    spi_send_config(opt_com_settings, opt_irq_settings, sig_mode);
     while (!device_init) {
         mcu_sleep();
     }
@@ -563,10 +569,12 @@ void spi_send(uint8_t c) {
 
 //---------------------------------------------------------------------------
 // Отправка конфигурации устройства через SPI
-void spi_send_config(uint8_t opt_com, uint8_t opt_irq) {
+void spi_send_config(uint8_t opt_com, uint8_t opt_irq, uint8_t start_mode) {
     uint8_t config_data = 0;
-    config_data |= (opt_com & 0x03);
-    config_data |= ((opt_irq & 0x03) << 2);
+    config_data |= (opt_com & 0x03);           // Base adress
+    config_data |= ((opt_irq & 0x03) << 2);    // IRQ
+    config_data |= ((start_mode & 0x03) << 4); // Enable signal
+
     spi_send(config_data);
 }
 
@@ -586,13 +594,13 @@ static inline void flash_led() {
 // Инициализация PS/2 мыши
 static void ps2m_init(void) {
     ps2_send(0xFF); // Сброс
-    if (ps2_recv() != 0xAA) { 
-        ps2_state = ps2_state_error; 
-        return; 
+    if (ps2_recv() != 0xAA) {
+        ps2_state = ps2_state_error;
+        return;
     }
-    if (ps2_recv() != 0x00) { 
-        ps2_state = ps2_state_error; 
-        return; 
+    if (ps2_recv() != 0x00) {
+        ps2_state = ps2_state_error;
+        return;
     }
 
     if (opt_wheel_enabled) {
@@ -626,21 +634,18 @@ static void ps2m_init(void) {
 //---------------------------------------------------------------------------
 // Отправка данных мыши через SPI
 void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
-    uint8_t lb, rb, mb;
+    uint8_t left_b, right_b, middle_b;
 
-    // Клавиши мыши
-    lb = b & 1;         // левая кнопка
-    rb = (b >> 1) & 1;  // правая кнопка
-    mb = (b >> 2) & 1;  // средняя кнопка
+    left_b = b & 1;
+    right_b = (b >> 1) & 1;
+    middle_b = (b >> 2) & 1;
 
-    // Стандартная часть протокола 
-    spi_send((1 << 6) | (lb << 5) | (rb << 4) | ((y & 0xC0) >> 4) | ((x & 0xC0) >> 6));
+    spi_send((1 << 6) | (left_b<< 5) | (right_b << 4) |
+                      ((y & 0xC0) >> 4) | ((x & 0xC0) >> 6));
     spi_send(x & 0x3F);
     spi_send(y & 0x3F);
-
-    // Расширенная часть протокола для мыши с колёсиком
     if (ps2m_wheel)
-        spi_send((mb << 4) | (z & 0x0F));
+        spi_send((middle_b << 4) | (z & 0x0F));
 
     flash_led();
 }
@@ -662,6 +667,7 @@ static inline uint16_t adc_read(uint8_t channel) {
     return ADC;
 }
 
+#if 1
 //---------------------------------------------------------------------------
 uint8_t checkIRQ(uint8_t opt_com) {
     PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
@@ -679,6 +685,39 @@ uint8_t checkIRQ(uint8_t opt_com) {
 
     return USE_IRQX;
 }
+#else
+// Тест логики определения наличия джампера нестандартных IRQ
+//---------------------------------------------------------------------------
+uint8_t checkIRQ(uint8_t opt_com) {
+    const uint8_t ADC_SAMPLES = 12;
+    uint32_t sum = 0, sumsq = 0;
+
+    // Кратковременно подаём 0 на вход ADC
+    DDR(ADC_PORT) |= _BV(IRQX_PIN);   // pin 26 IRQX как выход с лог 0
+    _delay_us(1);
+    DDR(ADC_PORT) &= ~_BV(IRQX_PIN);  // pin 26 IRQX как вход
+    // Если вывод не подключен, он должен какое-то время держать 0
+    _delay_us(1);
+
+    for (uint8_t i = 0; i < ADC_SAMPLES; i++) {
+        uint16_t v = adc_read(IRQX_PIN);
+        sum += v;
+        sumsq += (uint32_t)v * v;
+        _delay_us(50);
+    }
+    double mean = (double)sum / ADC_SAMPLES;
+    double std = sqrt(((double)sumsq / ADC_SAMPLES) - mean * mean);
+
+
+    if (mean > 1000.0 && std < 5.0) // Подтянуто к VCC
+        return USE_IRQX;
+
+    if (opt_com == SELECT_COM1 || opt_com == SELECT_COM3) {
+        return USE_IRQ4;
+    }
+    return USE_IRQ3;
+}
+#endif
 
 //---------------------------------------------------------------------------
 static void init(void) {
@@ -775,7 +814,7 @@ static void init(void) {
 
     // Таймер 2
     // Clock source: System Clock (8 MHZ)
-    ASSR = 0; 
+    ASSR = 0;
     TCCR2 = _BV(CS22)|_BV(CS21)|_BV(CS20); // CLK/1024
     TCNT2 = TIMER2_CONST;
     OCR2 = 0;
@@ -840,34 +879,43 @@ static inline void do_process(void) {
         if (unlikely(mouse_start)) { // Инициализация мыши
             mouse_start = false;
 
-            // Инициализируем SPI
+            // Очистка буферов данных
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
+                    for(uint8_t i = 0; i < (ps2m_wheel ? 4 : 3); i++) {
+                        ps2_rx_buf_count--;
+                        if (unlikely(++ps2_rx_buf_r == PS2_BUF_SIZE)) {
+                            ps2_rx_buf_r = 0;
+                        }
+                    }
+                }
+
                 spi_tx_buf_r = spi_tx_buf_w;
                 spi_tx_buf_count = 0;
                 spi_timer_stop();
             }
 
             // Приветствие Logitech/Microsoft Plus
-            _delay_ms(10);
+            _delay_ms(100);
             if (!mouse_enabled)
                             return;
-            spi_send(0x4D);
-//            _delay_ms(63);
-//            spi_send(0x33);
+            spi_send(0x4D); // Сигнатура MS mouse "M"
 
-            // Очистка буфера данных
-            while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
-                for(uint8_t i = 0; i < (ps2m_wheel ? 4 : 3); i++) ps2_read();
+            if (ps2m_wheel) {
+                spi_send(0x5A); // Сигнатура мыши с колёсиком "Z"
+                spi_send(0x40);
+                spi_send(0x00);
+                spi_send(0x00);
+                spi_send(0x00);
             }
+
         } else {
             // Выбираем полностью принятые данные
             while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
-                ps2m_b = ps2_read() & 7; //! Тут старшие биты!!!
+                ps2m_b = ps2_read() & (ps2m_wheel?7:3);
                 ps2m_x += (int8_t)ps2_read();
                 ps2m_y -= (int8_t)ps2_read();
-                if (ps2m_wheel) {
-                    ps2m_z += (int8_t)ps2_read();
-                }
+                ps2m_z += ps2m_wheel?(int8_t)ps2_read():0;
             }
 
             // пропускаем 0, 1 или 2 такта из 4
@@ -897,6 +945,10 @@ int main(void) {
     ps2_init();
     ps2m_init();
 
+    allow_send_data = true;
+    mouse_enabled = get_mouse_power_state();
+    mouse_start = true;
+
     for(;;) {
         if (likely(ps2_state != ps2_state_error)) {
             wdt_reset();
@@ -905,7 +957,7 @@ int main(void) {
         do_process();
 
         // Усыпляем процессор, если нет данных для обработки
-        if (likely((ps2_state == ps2_state_error) || 
+        if (likely((ps2_state == ps2_state_error) ||
                          (!allow_send_data &&
                           !ps2_rx_buf_count &&
                           !spi_tx_buf_count))) {

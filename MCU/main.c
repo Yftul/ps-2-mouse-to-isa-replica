@@ -11,8 +11,6 @@
 #include <util/delay.h>
 #include <util/atomic.h>
 
-#define sig_mode sig_RTS_and_DTR
-
 #define PS2_BUF_SIZE 128       // Размер приёмного буфера PS/2 порта
 #define SPI_TX_BUFFER_SIZE 128 // Размер буфера передачи SPI
 
@@ -67,7 +65,7 @@
 #define RATE_SEL2_PIN     5            // PD5 - нога 9
 
 //===========================================================================
-// ADC каналы
+// IRQ/ADC
 //===========================================================================
 #define ADC_PORT  C
 #define IRQ3_PIN  2            // PC2 - нога 25 IRQ3
@@ -75,47 +73,52 @@
 #define IRQ4_PIN  4            // PC4 - нога 27 IRQ4
 
 //===========================================================================
-// IRQ
+// Состояние UART IRQ
 //===========================================================================
-#define IRQX_threshold 512
+// 1 - не готовность приема символа, 0 - готовность
+#define not_rdy_2rcv(irq_pin) (PIN(ADC_PORT) & _BV(irq_pin))
 
 //===========================================================================
 // Светодиод
 //===========================================================================
-#define led_on()        PORT(LED_PORT) &= ~_BV(LED_PIN);
-#define led_off()       PORT(LED_PORT) |= _BV(LED_PIN);
+#define led_on()        (PORT(LED_PORT) &= ~_BV(LED_PIN));
+#define led_off()       (PORT(LED_PORT) |= _BV(LED_PIN));
 
 //===========================================================================
 // Soft SPI
 //===========================================================================
-#define spi_mosi_high()    PORT(SPI_MOSI_PORT) |= _BV(SPI_MOSI_PIN)
-#define spi_mosi_low()     PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN)
-#define spi_sck_high()     PORT(SPI_SCK_PORT) |= _BV(SPI_SCK_PIN)
-#define spi_sck_low()      PORT(SPI_SCK_PORT) &= ~_BV(SPI_SCK_PIN)
-#define spi_reset_high()   PORT(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN)
-#define spi_reset_low()    PORT(SPI_RESOUT_PORT) &= ~_BV(SPI_RESOUT_PIN)
+#define spi_mosi_high()    (PORT(SPI_MOSI_PORT) |= _BV(SPI_MOSI_PIN))
+#define spi_mosi_low()     (PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN))
+#define spi_sck_high()     (PORT(SPI_SCK_PORT) |= _BV(SPI_SCK_PIN))
+#define spi_sck_low()      (PORT(SPI_SCK_PORT) &= ~_BV(SPI_SCK_PIN))
+#define spi_reset_high()   (PORT(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN))
+#define spi_reset_low()    (PORT(SPI_RESOUT_PORT) &= ~_BV(SPI_RESOUT_PIN))
 
-#define spi_timer_stop()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0;}
-#define spi_timer_fast()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS10);}
-#define spi_timer_slow()   {TCCR1B &= ~(1 << CS12 | 1 << CS11 | 1 << CS10); TCNT1 = 0; TCCR1B |= (1 << CS11);}
+#define spi_timer_stop()   do {TCCR1B &= ~((1 << CS12) | (1 << CS11) | (1 << CS10)); TCNT1 = 0;} while (0);
+#define spi_timer_fast()   do {TCCR1B &= ~((1 << CS12) | (1 << CS11) | (1 << CS10)); TCNT1 = 0; TCCR1B |= (1 << CS10);} while (0);
+#define spi_timer_slow()   do {TCCR1B &= ~((1 << CS12) | (1 << CS11) | (1 << CS10)); TCNT1 = 0; TCCR1B |= (1 << CS11);} while (0);
 
-#define SPI_SEND_BIT(bit_mask, tx_byte) \
+#define SPI_SEND_BIT(bit_mask, tx_data) do { \
     spi_sck_low(); \
-    asm volatile("nop\n\t");\
-    if (tx_byte & (bit_mask)) spi_mosi_high(); else spi_mosi_low(); \
-    asm volatile("nop\n\t");\
-    spi_sck_high();\
-    asm volatile("nop\n\t");
+    asm volatile("nop\n\t"); \
+    if ((tx_data) & (bit_mask)) spi_mosi_high(); else spi_mosi_low(); \
+    asm volatile("nop\n\t"); \
+    spi_sck_high(); \
+    asm volatile("nop\n\t"); \
+} while (0)
 
-#define SPI_SEND_BYTE(tx_byte) \
-    SPI_SEND_BIT(0x80, tx_byte);\
-    SPI_SEND_BIT(0x40, tx_byte);\
-    SPI_SEND_BIT(0x20, tx_byte);\
-    SPI_SEND_BIT(0x10, tx_byte);\
-    SPI_SEND_BIT(0x08, tx_byte);\
-    SPI_SEND_BIT(0x04, tx_byte);\
-    SPI_SEND_BIT(0x02, tx_byte);\
-    SPI_SEND_BIT(0x01, tx_byte);
+#define SPI_SEND_PACKET(tx_data) do {\
+    SPI_SEND_BIT(0x40, (tx_data));\
+    SPI_SEND_BIT(0x20, (tx_data));\
+    SPI_SEND_BIT(0x10, (tx_data));\
+    SPI_SEND_BIT(0x08, (tx_data));\
+    SPI_SEND_BIT(0x04, (tx_data));\
+    SPI_SEND_BIT(0x02, (tx_data));\
+    SPI_SEND_BIT(0x01, (tx_data));} while (0);
+
+#define SPI_RESET() \
+    spi_reset_high();\
+    spi_reset_low();
 
 //===========================================================================
 // PS/2
@@ -134,19 +137,6 @@ typedef enum {
     SELECT_COM3 = 2,
     SELECT_COM4 = 3,
 } com_select_t;
-
-//===========================================================================
-// Select UART IRQ
-//===========================================================================
-typedef enum {
-    NO_IRQ = 0,
-    USE_IRQ4 = 1,
-    USE_IRQ3 = 2,
-    USE_IRQX = 3,
-} use_irq_t;
-
-static const uint8_t IRQ2PIN[] = {NO_IRQ, IRQ4_PIN, IRQ3_PIN, IRQX_PIN};
-#define not_rdy_2rcv(irq_pin) (PIN(ADC_PORT) & _BV(IRQ2PIN[irq_pin]))
 
 //===========================================================================
 // Select mouse Duty cycles
@@ -168,13 +158,6 @@ typedef enum {
 //===========================================================================
 // Глобальные переменные
 //===========================================================================
-enum sig_enable_device {
-    sig_RTS = 0,
-    sig_DTR = 1,
-    sig_RTS_or_DTR = 2,
-    sig_RTS_and_DTR = 3
-};
-
 enum ps_state_t {
     ps2_state_error,
     ps2_state_read,
@@ -191,11 +174,11 @@ volatile uint8_t ps2_rx_buf_w;
 volatile uint8_t ps2_rx_buf_r;
 volatile uint8_t ps2_rx_buf_count;
 
-volatile uint8_t opt_com_settings;
-volatile uint8_t opt_wheel_enabled;
-volatile uint8_t opt_duty_settings;
-volatile uint8_t opt_rate_settings;
-volatile uint8_t opt_irq_settings;
+uint8_t opt_com_settings;
+uint8_t opt_wheel_enabled;
+uint8_t opt_duty_settings;
+uint8_t opt_rate_settings;
+uint8_t opt_irq_settings;
 
 uint8_t spi_tx_buf[SPI_TX_BUFFER_SIZE];
 volatile uint8_t spi_tx_buf_w;
@@ -211,7 +194,7 @@ volatile uint8_t allow_send_data;  // Флаг синхронизации пер
 // Декларации функций
 //===========================================================================
 static inline void ps2_rx_push(uint8_t c);
-void spi_send_config(uint8_t opt_com, uint8_t opt_irq, uint8_t start_mode);
+void spi_send_config(uint8_t opt_com, uint8_t opt_irq);
 void spi_send(uint8_t c);
 
 //===========================================================================
@@ -337,7 +320,7 @@ ISR(TIMER1_COMPA_vect) {
     spi_tx_buf_count--;
 
     // Линейная передача без циклов
-    SPI_SEND_BYTE(current_byte);
+    SPI_SEND_PACKET(current_byte);
 
     // Завершение передачи
     spi_sck_low();
@@ -526,28 +509,27 @@ void ps2_send(uint8_t c) {
 //===========================================================================
 // Инициализация Soft SPI
 void spi_init(void) {
-    spi_reset_high(); // Сброс подсистемы SPI CPLD
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         spi_tx_buf_w = 0;
         spi_tx_buf_r = 0;
         spi_tx_buf_count = 0;
 
         // CPLD сброшен, требуется передача байта конфигурации
-        device_init = false;
-
-        spi_sck_low();
-        spi_mosi_low();
-
-        spi_reset_low();  // CPLD активен
+        if (!device_init) {
+            // Сбрасываем базовые настройки устройства
+            spi_mosi_high();
+            _delay_us(1);
+            spi_mosi_low();
+            // Инициализация порта и IRQ
+            spi_send_config(opt_com_settings, opt_irq_settings);
+        }
+        _delay_us(1);
+        spi_reset_low();
     }
 
-    // Инициализация порта и IRQ
-    spi_send_config(opt_com_settings, opt_irq_settings, sig_mode);
     while (!device_init) {
         mcu_sleep();
     }
-    // Начальное значение регистра приёмника
-    spi_send(0x00);
 }
 
 //---------------------------------------------------------------------------
@@ -569,11 +551,10 @@ void spi_send(uint8_t c) {
 
 //---------------------------------------------------------------------------
 // Отправка конфигурации устройства через SPI
-void spi_send_config(uint8_t opt_com, uint8_t opt_irq, uint8_t start_mode) {
+void spi_send_config(uint8_t opt_com, uint8_t opt_irq) {
     uint8_t config_data = 0;
-    config_data |= (opt_com & 0x03);           // Base adress
-    config_data |= ((opt_irq & 0x03) << 2);    // IRQ
-    config_data |= ((start_mode & 0x03) << 4); // Enable signal
+    config_data |= (opt_com & 0x03);            // Base adress
+    config_data |= (opt_irq == IRQX_PIN)?0x4:0; // Не использовать стандартное IRQ
 
     spi_send(config_data);
 }
@@ -667,30 +648,17 @@ static inline uint16_t adc_read(uint8_t channel) {
     return ADC;
 }
 
-#if 1
 //---------------------------------------------------------------------------
-uint8_t checkIRQ(uint8_t opt_com) {
-    PORT(ADC_PORT) |= _BV(IRQX_PIN); // Включить подтяжку PC3
-    _delay_us(10); // ждём стабилизацию уровня
-    uint16_t tmp = adc_read(IRQX_PIN);
-    PORT(ADC_PORT) &= ~_BV(IRQX_PIN); // Отключить подтяжку PC3
-
-    // Определяем используется ли прерывание IRQX (джампер опускает напряжение к 0)
-    if (tmp > IRQX_threshold) { // Напряжение на выводе IRQ выше заданного значения
-        if (opt_com == SELECT_COM1 || opt_com == SELECT_COM3) {
-            return USE_IRQ4;
-        }
-        return USE_IRQ3;
-    }
-
-    return USE_IRQX;
-}
-#else
 // Тест логики определения наличия джампера нестандартных IRQ
 //---------------------------------------------------------------------------
-uint8_t checkIRQ(uint8_t opt_com) {
+uint8_t checkIRQ(uint8_t opt_com)
+{
+    const uint16_t threshold_mean = 1000;
+    const uint16_t threshold_var  = 50;
     const uint8_t ADC_SAMPLES = 12;
-    uint32_t sum = 0, sumsq = 0;
+    uint32_t sumsq = 0;
+    uint16_t sum = 0;
+    uint16_t val;
 
     // Кратковременно подаём 0 на вход ADC
     DDR(ADC_PORT) |= _BV(IRQX_PIN);   // pin 26 IRQX как выход с лог 0
@@ -699,25 +667,46 @@ uint8_t checkIRQ(uint8_t opt_com) {
     // Если вывод не подключен, он должен какое-то время держать 0
     _delay_us(1);
 
-    for (uint8_t i = 0; i < ADC_SAMPLES; i++) {
-        uint16_t v = adc_read(IRQX_PIN);
-        sum += v;
-        sumsq += (uint32_t)v * v;
-        _delay_us(50);
+    // Собираем ADC выборки
+    for (uint8_t i = 0; i < ADC_SAMPLES; i++)
+    {
+        adc_read(IRQX_PIN);
+        val = ADC;
+        sum += val;
+        sumsq += (uint32_t)val * val;
     }
-    double mean = (double)sum / ADC_SAMPLES;
-    double std = sqrt(((double)sumsq / ADC_SAMPLES) - mean * mean);
 
+    // Среднее значение
+    uint16_t mean = sum / ADC_SAMPLES;
 
-    if (mean > 1000.0 && std < 5.0) // Подтянуто к VCC
-        return USE_IRQX;
+    // Целочисленная дисперсия (средний квадрат отклонений)
+    // var = (E[x²] - (E[x])²)
+    uint32_t mean_sq = (uint32_t)mean * mean;
+    uint32_t var = (sumsq / ADC_SAMPLES);
+    if (var > mean_sq) {
+        var -= mean_sq;
+    } else {
+        var = 0;
+    }
+
+    /*
+     * Теперь проверяем:
+     * - сигнал стабильно высокий (mean > threshold_high)
+     * - сигнал не шумный (var < threshold_var)
+     * 
+     * Пороговые значения подобраны эмпирически:
+     *   mean > 1000  → уровень лог.1
+     *   var < 50     → низкий шум
+     */
+    if (mean > threshold_mean && var < threshold_var)
+        return IRQX_PIN;
 
     if (opt_com == SELECT_COM1 || opt_com == SELECT_COM3) {
-        return USE_IRQ4;
+        return IRQ4_PIN;
     }
-    return USE_IRQ3;
+    return IRQ3_PIN;
+
 }
-#endif
 
 //---------------------------------------------------------------------------
 static void init(void) {
@@ -766,13 +755,13 @@ static void init(void) {
     DDR(SPI_SCK_PORT) |= _BV(SPI_SCK_PIN);   // pin 28 (PC5) как выход soft SPI CLC
     PORT(SPI_SCK_PORT) &= ~_BV(SPI_SCK_PIN); // PC5 = 0
 
-    DDRC &= ~_BV(6);  // pin 29 (PC7) как вход(аппаратный #Reset)
-    PORTC |= _BV(6);  // Подтяжка на PC7
+    DDRC &= ~_BV(6);  // pin 29 (PC6) как вход(аппаратный #Reset)
+    PORTC |= _BV(6);  // Подтяжка на PC6
 
 //---------------------------------------------------------------------------
 // Port D
     DDR(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN);  // pin 30 (PD0) выход soft SPI reset
-    PORT(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN); // PD0 = 1 Сброс подсистемы SPI slave
+    PORT(SPI_RESOUT_PORT) |= _BV(SPI_RESOUT_PIN); // PD0 = 1 Сброс подсистемы SPI
 
     DDR(SPI_MOSI_PORT) |= _BV(SPI_MOSI_PIN);   // pin 31 (PD1) выход soft SPI MOSI
     PORT(SPI_MOSI_PORT) &= ~_BV(SPI_MOSI_PIN); // PD1 = 0
@@ -807,9 +796,9 @@ static void init(void) {
     TCCR1A = 0;  // Normal port operation
     TCCR1B = (1 << WGM12);  // CTC mode
 
-    // Расчет значения для сравнения (2mks)
+    // Расчет значения для сравнения
     // Необходимое количество тактов = Время / Период_такта
-    // 2mks / 125ns = 2000mks / 125ns = 16 тактов (0-15)
+    // Число тактов = Период(ns) / 125(ns)
     OCR1A = TIMER1_CONST;
 
     // Таймер 2
@@ -835,7 +824,7 @@ static void init(void) {
     SFIOR = 0;
 
     // Инициализация ADC
-    ADMUX = (0 << REFS1) | (0 << REFS0); // Vref = AVCC
+    ADMUX = (0 << REFS1) | (1 << REFS0); // Vref = AVCC
     ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS0);  // Включить ADC, делитель 32
 
     // Определяем конфигурацию джамперов
@@ -846,14 +835,17 @@ static void init(void) {
     opt_irq_settings = checkIRQ(opt_com_settings);
 
     switch(get_reset_source()) {
-        case _BV(EXTRF): // External reset
-                led_on();
-                _delay_ms(100); // Сигнализируем исправность светодиода
-                led_off();
-                break;
         case _BV(WDRF): // Watchdog reset
-        case _BV(PORF): // Power-on reset
-        case _BV(BORF): // Brown-out reset
+            device_init = true;
+            break;
+        case _BV(EXTRF): // External reset
+            led_on();    // Сигнализируем исправность светодиода
+            _delay_ms(50);
+        case _BV(PORF):    // Power-on reset
+        case _BV(BORF):    // Brown-out reset
+            _delay_ms(50); // Ждём окончания переходных процессов
+            led_off();
+            device_init = false;
             break;
     }
 
@@ -872,23 +864,27 @@ static inline void do_process(void) {
     static int16_t ps2m_y;
     static int16_t ps2m_z;
 
+    // Полностью выбираем принятые данные
+    while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
+        ps2m_b = ps2_read() & (ps2m_wheel?7:3);
+        ps2m_x += (int8_t)ps2_read();
+        ps2m_y -= (int8_t)ps2_read();
+        ps2m_z += ps2m_wheel?(int8_t)ps2_read():0;
+    }
+
+    // Мышь включена и таймер следующей посылки активен
     if (allow_send_data && mouse_enabled) {
         allow_send_data = false;
         dr_ctr = (dr_ctr + 1) & 0x03;
 
-        if (unlikely(mouse_start)) { // Инициализация мыши
+        // Инициализация мыши
+        if (unlikely(mouse_start)) {
             mouse_start = false;
 
-            // Очистка буферов данных
+            // Очистка данных
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
-                    for(uint8_t i = 0; i < (ps2m_wheel ? 4 : 3); i++) {
-                        ps2_rx_buf_count--;
-                        if (unlikely(++ps2_rx_buf_r == PS2_BUF_SIZE)) {
-                            ps2_rx_buf_r = 0;
-                        }
-                    }
-                }
+                ps2m_x = 0; ps2m_y = 0;
+                ps2m_z = 0; ps2m_b = 0;
 
                 spi_tx_buf_r = spi_tx_buf_w;
                 spi_tx_buf_count = 0;
@@ -896,7 +892,7 @@ static inline void do_process(void) {
             }
 
             // Приветствие Logitech/Microsoft Plus
-            _delay_ms(100);
+            _delay_ms(14);
             if (!mouse_enabled)
                             return;
             spi_send(0x4D); // Сигнатура MS mouse "M"
@@ -910,14 +906,6 @@ static inline void do_process(void) {
             }
 
         } else {
-            // Выбираем полностью принятые данные
-            while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
-                ps2m_b = ps2_read() & (ps2m_wheel?7:3);
-                ps2m_x += (int8_t)ps2_read();
-                ps2m_y -= (int8_t)ps2_read();
-                ps2m_z += ps2m_wheel?(int8_t)ps2_read():0;
-            }
-
             // пропускаем 0, 1 или 2 такта из 4
             if (likely(dr_ctr >= opt_duty_settings)) {
                 // Передаём, если что-то изменилось

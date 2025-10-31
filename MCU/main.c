@@ -1,3 +1,20 @@
+/******************************************************************************
+ * Project : PS/2-to-ISA Mouse Adapter — Replica
+ * File    : main.c
+ * Author  : Pyshchev Alexander aka Yftul
+ * License : GPL-3.0
+ *
+ * Description :
+ *     Firmware module for microcontroller side of PS/2-to-ISA adapter.
+ *     Handles PS/2 mouse communication, event parsing, buffering, and
+ *     translation into ISA bus signals understood by legacy hardware.
+ *
+ * Notes :
+ *     - Designed for embedded 8-bit MCU (e.g., AVR).
+ *     - Uses interrupt-driven PS/2 input and simple state machine for
+ *       compatibility and low latency.
+ ******************************************************************************/
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -11,12 +28,14 @@
 #include <util/delay.h>
 #include <util/atomic.h>
 
-#define PS2_BUF_SIZE 128       // Размер приёмного буфера PS/2 порта
-#define SPI_TX_BUFFER_SIZE 128 // Размер буфера передачи SPI
+#define PS2_BUF_SIZE 255       // Размер приёмного буфера PS/2 порта
+#define SPI_TX_BUFFER_SIZE 255 // Размер буфера передачи SPI
 
 #define TIMER0_CONST 0x9F // Регулирует скорость передачи данных мыши
 #define TIMER1_CONST 0x4F // Регулирует скорость передачи SPI
 #define TIMER2_CONST 0x7F // Регулирует длительность послесвечения светодиода
+
+#define serial_rate 8 // Задержка при передаче данных без проверки 
 
 #define GLUE(a, b)     a##b
 
@@ -114,11 +133,15 @@
     SPI_SEND_BIT(0x08, (tx_data));\
     SPI_SEND_BIT(0x04, (tx_data));\
     SPI_SEND_BIT(0x02, (tx_data));\
-    SPI_SEND_BIT(0x01, (tx_data));} while (0);
+    SPI_SEND_BIT(0x01, (tx_data));\
+    /*Завершение передачи*/\
+    spi_sck_low();\
+    spi_mosi_low();\
+}while (0);
 
-#define SPI_RESET() \
+#define SPI_RESET() do {\
     spi_reset_high();\
-    spi_reset_low();
+    spi_reset_low();} while (0);
 
 //===========================================================================
 // PS/2
@@ -151,9 +174,10 @@ typedef enum {
 // Select data rate
 //===========================================================================
 // Скорость мыши
-#define PS2_SAMPLES_PER_SEC_FAST    80 // 10, 20, 40, 60, 80, 100, 200
-#define PS2_SAMPLES_PER_SEC_MID     40 // 10, 20, 40, 60, 80, 100, 200
-#define PS2_SAMPLES_PER_SEC_SLOW    20 // 10, 20, 40, 60, 80, 100, 200
+// Допустимые значения: 10, 20, 40, 60, 80, 100, 200
+#define PS2_SAMPLES_PER_SEC_FAST    80 
+#define PS2_SAMPLES_PER_SEC_MID     40
+#define PS2_SAMPLES_PER_SEC_SLOW    20
 
 //===========================================================================
 // Глобальные переменные
@@ -300,6 +324,7 @@ ISR(TIMER1_COMPA_vect) {
 
     // Проверяем возможность передачи
     if (unlikely(not_rdy_2rcv(opt_irq_settings) && device_init)) {
+        // Медленно продолжаем проверять возможность передачи
         spi_timer_slow();
         return;
     }
@@ -310,7 +335,7 @@ ISR(TIMER1_COMPA_vect) {
         return;
     }
 
-    device_init = 1;
+    device_init = true;
 
     // Забираем байт из буфера
     current_byte = spi_tx_buf[spi_tx_buf_r];
@@ -321,10 +346,6 @@ ISR(TIMER1_COMPA_vect) {
 
     // Линейная передача без циклов
     SPI_SEND_PACKET(current_byte);
-
-    // Завершение передачи
-    spi_sck_low();
-    spi_mosi_low();
 
     // Управление таймером
     if (likely(!spi_tx_buf_count)) { // Нечего передавать, останавливаемся
@@ -649,7 +670,7 @@ static inline uint16_t adc_read(uint8_t channel) {
 }
 
 //---------------------------------------------------------------------------
-// Тест логики определения наличия джампера нестандартных IRQ
+// Определение используемого IRQ
 //---------------------------------------------------------------------------
 uint8_t checkIRQ(uint8_t opt_com)
 {
@@ -854,22 +875,64 @@ static void init(void) {
 
     // Включение прерываний
     sei();
+
+    // Инициализация CPLD части
+    spi_init();
+
+    // Инициализация PS2 части
+    ps2_init();
+    ps2m_init();
+
+//    allow_send_data = true;
+    mouse_enabled = get_mouse_power_state();
+    mouse_start = true;
 }
 
-static inline void do_process(void) {
-    static uint8_t smb1 = 0;
-    static uint8_t dr_ctr = 0;
-    static uint8_t ps2m_b;
-    static int16_t ps2m_x;
-    static int16_t ps2m_y;
-    static int16_t ps2m_z;
+//---------------------------------------------------------------------------
+static inline void send_mouse_id(void) {
+    // Имитация переходных процессов при включении
+    _delay_ms(20);
 
-    // Полностью выбираем принятые данные
+    // Дожидаемся передачи
+    while(spi_tx_buf_count) ;
+
+    // Не передаем ID при кратковременных включениях
+    if (!mouse_enabled)
+                    return;
+
+    // Приветствие Logitech/Microsoft Plus
+    // Прерывание может быть запрещено
+    // передаем без проверки, со скоростью COM мыши
+    SPI_SEND_PACKET(0x4D); _delay_ms(serial_rate); // Сигнатура MS mouse "M"
+    if (ps2m_wheel) {
+        SPI_SEND_PACKET(0x5A); _delay_ms(serial_rate); // Сигнатура мыши с колёсиком "Z"
+        SPI_SEND_PACKET(0x40); _delay_ms(serial_rate); // Четырехбайтные пакеты
+        SPI_SEND_PACKET(0x00); _delay_ms(serial_rate); // Пустой пакет байт 2
+        SPI_SEND_PACKET(0x00); _delay_ms(serial_rate); // Пустой пакет байт 3
+        SPI_SEND_PACKET(0x00); _delay_ms(serial_rate); // Пустой пакет байт 4
+    } else {
+        SPI_SEND_PACKET(0x33); _delay_ms(serial_rate); // Сигнатура 3х кнопочной мыши "3"
+        SPI_SEND_PACKET(0x40); _delay_ms(serial_rate); // Трёхбайтные пакеты
+        SPI_SEND_PACKET(0x00); _delay_ms(serial_rate); // Пустой пакет байт 2
+        SPI_SEND_PACKET(0x00); _delay_ms(serial_rate); // Пустой пакет байт 3
+    }
+}
+
+//---------------------------------------------------------------------------
+static inline void do_process(void) {
+    static uint8_t st_m_bt = 0;
+    static uint8_t dr_ctr = 0;
+    static uint8_t m_bt;
+    static int16_t m_cx;
+    static int16_t m_cy;
+    static int16_t m_cz;
+
+    // Полностью выбираем принятые пакеты
     while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
-        ps2m_b = ps2_read() & (ps2m_wheel?7:3);
-        ps2m_x += (int8_t)ps2_read();
-        ps2m_y -= (int8_t)ps2_read();
-        ps2m_z += ps2m_wheel?(int8_t)ps2_read():0;
+        m_bt = ps2_read() & (ps2m_wheel?7:3);
+        m_cx += (int8_t)ps2_read();
+        m_cy -= (int8_t)ps2_read();
+        m_cz += ps2m_wheel?(int8_t)ps2_read():0;
     }
 
     // Мышь включена и таймер следующей посылки активен
@@ -883,59 +946,40 @@ static inline void do_process(void) {
 
             // Очистка данных
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                ps2m_x = 0; ps2m_y = 0;
-                ps2m_z = 0; ps2m_b = 0;
+                m_cx = 0; m_cy = 0;
+                m_cz = 0; m_bt = 0;
 
                 spi_tx_buf_r = spi_tx_buf_w;
                 spi_tx_buf_count = 0;
                 spi_timer_stop();
+                SPI_RESET();
             }
 
-            // Приветствие Logitech/Microsoft Plus
-            _delay_ms(14);
-            if (!mouse_enabled)
-                            return;
-            spi_send(0x4D); // Сигнатура MS mouse "M"
+            send_mouse_id();
+        }
 
-            if (ps2m_wheel) {
-                spi_send(0x5A); // Сигнатура мыши с колёсиком "Z"
-                spi_send(0x40);
-                spi_send(0x00);
-                spi_send(0x00);
-                spi_send(0x00);
-            }
+        // пропускаем 0, 1 или 2 такта из 4
+        if (likely(dr_ctr >= opt_duty_settings)) {
+            // Передаём, если что-то изменилось
+            if (m_bt != st_m_bt || m_cx || m_cy || m_cz) {
+                int8_t cx = clamp(m_cx, -128, 127);
+                m_cx -= cx;
+                int8_t cy = clamp(m_cy, -128, 127);
+                m_cy -= cy;
+                int8_t cz = clamp(m_cz, -8, 7);
+                m_cz -= cz;
 
-        } else {
-            // пропускаем 0, 1 или 2 такта из 4
-            if (likely(dr_ctr >= opt_duty_settings)) {
-                // Передаём, если что-то изменилось
-                if (ps2m_b != smb1 || ps2m_x || ps2m_y || ps2m_z) {
-                    int8_t cx = clamp(ps2m_x, -128, 127);
-                    ps2m_x -= cx;
-                    int8_t cy = clamp(ps2m_y, -128, 127);
-                    ps2m_y -= cy;
-                    int8_t cz = clamp(ps2m_z, -8, 7);
-                    ps2m_z -= cz;
+                st_m_bt = m_bt;
 
-                    smb1 = ps2m_b;
-
-                    spi_m_send(cx, cy, cz, ps2m_b);
-                }
+                spi_m_send(cx, cy, cz, m_bt);
             }
         }
     }
 }
 
+//---------------------------------------------------------------------------
 int main(void) {
     init();
-    spi_init();
-
-    ps2_init();
-    ps2m_init();
-
-    allow_send_data = true;
-    mouse_enabled = get_mouse_power_state();
-    mouse_start = true;
 
     for(;;) {
         if (likely(ps2_state != ps2_state_error)) {
@@ -946,10 +990,9 @@ int main(void) {
 
         // Усыпляем процессор, если нет данных для обработки
         if (likely((ps2_state == ps2_state_error) ||
-                         (!allow_send_data &&
-                          !ps2_rx_buf_count &&
-                          !spi_tx_buf_count))) {
-            mcu_sleep();
-        }
+                        (!allow_send_data &&
+                         !ps2_rx_buf_count &&
+                         !spi_tx_buf_count))
+            ) mcu_sleep();
     }
 }

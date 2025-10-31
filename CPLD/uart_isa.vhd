@@ -1,3 +1,20 @@
+-- ============================================================================
+--  Project : PS/2-to-ISA Mouse Adapter — Replica
+--  File    : uart_isa.vhd
+--  Author  : Pyshchev Alexander aka Yftul
+--  License : GPL-3.0
+--
+--  Description :
+--      Implements ISA bus interface logic for adapting a PS/2 mouse
+--      to legacy PC hardware. Includes address decoding, control signal
+--      generation, and data flow between the MCU and ISA connector.
+--
+--  Notes :
+--      Designed for retro hardware restoration and compatibility testing.
+--      Part of a mixed hardware/firmware project including CPLD logic
+--      and MCU-based PS/2 protocol handling.
+-- ============================================================================
+
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.NUMERIC_STD.ALL;
@@ -30,13 +47,12 @@ architecture Behavioral of uart_isa is
     -- Регистры UART
     signal rx_data_reg    : std_logic_vector(6 downto 0) := (others => '0');  -- Received data register
     signal int_ena_reg    : std_logic_vector(3 downto 0) := (others => '0');  -- Int enable register
---    signal line_ctl_reg   : std_logic_vector(7 downto 0) := (others => '0');  -- Line control register
     signal mdm_ctl_reg    : std_logic_vector(4 downto 0) := (others => '0');  -- Modem control register
     signal gen_reg        : std_logic_vector(7 downto 0) := (others => '0');  -- Fake register
 
     -- Регистры накопления данных UART
     signal rx_acc_reg     : std_logic_vector(6 downto 0) := (others => '0');    -- Аккумулятор бит от MCU
-    signal bit_counter    : unsigned(2 downto 0) := (others => '0');            -- Счётчик бит от MCU
+    signal bit_counter    : std_logic_vector(2 downto 0) := (others => '0');    -- Счётчик бит от MCU
 
     -- Сигналы управления IRQ
     signal SET_RxD_IRQ    : std_logic := '0'; -- сигнал запроса установки RxD_IRQ
@@ -50,10 +66,12 @@ architecture Behavioral of uart_isa is
     signal data_out       : std_logic_vector(7 downto 0) := (others => '0'); -- Буфер вывода данных ISA
     signal base_addr_val  : std_logic_vector(1 downto 0) := "00";            -- Компорт по умолчанию после включения
     signal use_opt_irq    : std_logic := '0';                                -- IRQ по умолчанию после включения
+
+    -- Разное
     signal device_rdy     : std_logic := '0'; -- Устройство не готово к обмену по ISA сразу после включения;
-    signal recv_data_rdy  : std_logic := '0'; -- Готовность принятых данных;
-    signal enable_mouse   : std_logic := '0';
     signal sig_DLAB       : std_logic := '0';
+
+    alias enable_mouse is mdm_ctl_reg(1); -- (RTS)
 
      -- Сигналы адресного компаратора
     type base_addr_array_t is array (0 to 3) of std_logic_vector(6 downto 0);
@@ -64,10 +82,10 @@ architecture Behavioral of uart_isa is
         3 => "1011101");-- COM4 = 0x2E8 >> 3 = 0x5D
 
 begin
-    process(isa_ior, isa_reset) -- Асинхронное чтение регистров UART c ISA шины
+    process(isa_ior, isa_reset, sig_DLAB, RxD_IRQ) -- Асинхронное чтение регистров UART c ISA шины
     begin
         if isa_reset = '0' then
-            if falling_edge(isa_ior) then -- Чтение из регистров UART
+              if falling_edge(isa_ior) then -- Чтение из регистров UART
                 if (device_select = '1') then
                     data_out <= (others => '0');
                     case isa_addr(2 downto 0) is
@@ -86,7 +104,8 @@ begin
                         when "010" => -- причина прерывания: xxxxx10x = принят символ; сбрасывается чтением приемника
                             if RxD_IRQ = '1' then             -- Прерывание готовности принятого символа
                                 data_out <= "00000100";       -- Сигнализация готовности принятого символа
-                            else if int_ena_reg(1) = '1' then -- Прерывание готовности передачи символа
+                            else
+                                if int_ena_reg(1) = '1' then -- Прерывание готовности передачи символа
                                     data_out <= "00000010";   -- Сигнализация готовности передачи символа
                                 else
                                     data_out <= "00000001";   -- Нет прерываний для обработки
@@ -99,7 +118,7 @@ begin
                         when "101" =>                         -- Line status register
                             data_out <= "0110000" & RxD_IRQ; 
                         when "110" =>                         -- Modem status register
-                                data_out <= "00" & mdm_ctl_reg(0) & mdm_ctl_reg(1) & "0000"; -- CTS = RTS , DSR = DTR
+                            data_out <= "00" & mdm_ctl_reg(0) & mdm_ctl_reg(1) & "0000"; -- CTS = RTS , DSR = DTR
                         when others => null;
                     end case;
                 end if;
@@ -107,10 +126,11 @@ begin
         end if;
     end process;
 
-    process(isa_iow, isa_reset) begin -- Асинхронная запись в регистры UART
+    process(isa_iow, isa_reset, sig_DLAB) begin -- Асинхронная запись в регистры UART
         if isa_reset = '1' then -- Сброс ISA шины
             int_ena_reg <= (others => '0'); -- Запрет прерываний
             mdm_ctl_reg <= (others => '0');
+            sig_DLAB <= '0';
         else
             if rising_edge(isa_iow) then -- Запись в регистры UART
                 if (device_select = '1') then
@@ -123,7 +143,7 @@ begin
                             if sig_DLAB = '0' then -- !DLAB check
                                 int_ena_reg <= isa_data(3 downto 0);
                             else
---                                gen_reg <= isa_data;
+--                                gen_reg <= isa_data; -- конфликтует с определением порта в биос
                             end if;
                         when "011" =>
                             gen_reg(6 downto 0) <= isa_data(6 downto 0);
@@ -137,47 +157,73 @@ begin
         end if;
     end process;
 
-    process(mcu_clk, mcu_res) begin
+    process(mcu_clk, mcu_res, device_rdy) begin
         if mcu_res = '1' then
             bit_counter <= "000";
         else
             if rising_edge(mcu_clk) then -- Записываем данные по фронту сигнала
-                rx_acc_reg(6 - to_integer(bit_counter)) <= mcu_rxd;
-                if bit_counter = 6 then
-                    bit_counter <= (others => '0');
-                else
-                    bit_counter <= bit_counter + 1;
-                end if;
+                case bit_counter is
+                    when "000" => rx_acc_reg(6) <= mcu_rxd;
+                                  bit_counter <= "001";
+                    when "001" => rx_acc_reg(5) <= mcu_rxd;
+                                  bit_counter <= "010";
+                    when "010" => rx_acc_reg(4) <= mcu_rxd;
+                                  bit_counter <= "011";
+                    when "011" => rx_acc_reg(3) <= mcu_rxd;
+                                  bit_counter <= "100";
+                    when "100" =>
+                            if (device_rdy = '1') then
+                                rx_acc_reg(2) <= mcu_rxd;
+                            else 
+                                use_opt_irq <= mcu_rxd;
+                            end if;
+                            bit_counter <= "101";
+                    when "101" => -- rx_acc_reg(1) <= mcu_rxd;
+                            if (device_rdy = '1') then
+                                rx_acc_reg(1) <= mcu_rxd;
+                            else 
+                                base_addr_val(1) <= mcu_rxd;
+                            end if;
+                            bit_counter <= "110";
+                    when "110" => -- rx_acc_reg(0) <= mcu_rxd;
+                            if (device_rdy = '1') then
+                                rx_acc_reg(0) <= mcu_rxd;
+                            else 
+                                base_addr_val(0) <= mcu_rxd;
+                            end if;
+                            bit_counter <= "000";
+                    when others =>
+                            bit_counter <= "000";
+                    end case;
             end if;
         end if;
     end process;
 
-    process(mcu_clk, mcu_res, mcu_rxd, bit_counter) begin -- Работа с MCU
+    -- Работа с MCU
+    process(isa_reset, mcu_clk, mcu_res, mcu_rxd, bit_counter) begin
         if mcu_res = '1' then
             if (mcu_rxd = '1') then -- Последовательность для установки готовности
                 device_rdy <= '0';  -- Сбрасываем готовность устройства
             end if;
-            recv_data_rdy <= '0';
         else
-            if falling_edge(mcu_clk) and (bit_counter = "000") then -- Верифицируем по спаду
-                if (device_rdy = '0') then -- Первый байт данных от MCU - приходит базовый адрес устройства и номер IRQ
-                    base_addr_val(1 downto 0) <= rx_acc_reg(1 downto 0); -- Базовый адрес устройства
-                    use_opt_irq <= rx_acc_reg(2); -- Использовать нестандартный IRQ
-                    device_rdy <= '1'; -- Готовность устройства(если не установлено по умолчанию)
-                else  -- Последующие данные от мыши
-                    rx_data_reg <= rx_acc_reg;
-                    recv_data_rdy <= '1'; -- Готовность принятых данных
+            if falling_edge(mcu_clk) then -- Верифицируем по спаду
+                if (bit_counter = "000") then
+                    if (device_rdy = '0') then -- Первый байт данных от MCU - приходит базовый адрес устройства и номер IRQ
+                        device_rdy <= '1'; -- Готовность устройства(если не установлено по умолчанию)
+                    else  -- Последующие данные от мыши
+                        rx_data_reg <= rx_acc_reg;
+                    end if;
                 end if;
             end if;
         end if;
     end process;
 
-    process(isa_reset, mcu_res, mcu_clk, recv_data_rdy, bit_counter, RxD_IRQ) -- Процесс формирования сигнала установки прерывания
+    process(isa_reset, mcu_res, mcu_clk, device_rdy, bit_counter, RxD_IRQ) -- Процесс формирования сигнала установки прерывания
     begin
         if isa_reset = '1' or mcu_res = '1' or RxD_IRQ = '1' then
             SET_RxD_IRQ <= '0';    -- Сбрасываем признак прерывания
         elsif falling_edge(mcu_clk) then -- Верифицируем по спаду
-            if (bit_counter = "000") and (recv_data_rdy = '1') then -- Если байт принят и есть готовность данных
+            if (bit_counter = "000") and (device_rdy = '1') then -- Если байт принят и есть готовность данных
                 SET_RxD_IRQ <= '1'; -- Устанавливаем признак прерывания
             end if;
         end if;
@@ -198,8 +244,8 @@ begin
         end if;
     end process;
 
-    process(isa_reset, RES_RxD_IRQ, SET_RxD_IRQ) begin -- RS триггер состояния прерывания приёма данных
-        if isa_reset = '1' or RES_RxD_IRQ = '1' then
+    process(isa_reset, SET_RxD_IRQ, mcu_res, RES_RxD_IRQ) begin -- RS триггер состояния прерывания приёма данных
+        if isa_reset = '1' or mcu_res = '1' or RES_RxD_IRQ = '1' then
             RxD_IRQ <= '0';
         elsif SET_RxD_IRQ = '1' then
             RxD_IRQ <= '1';
@@ -210,15 +256,14 @@ begin
     mcu_isa_res <= not isa_reset; -- Передача сигнала сброса ISA шины на MCU
     mcu_DTR <= enable_mouse;
 
-    enable_mouse <= mdm_ctl_reg(1); -- (RTS)
-
     device_select <= '1' when (isa_aen = '0') and (device_rdy = '1') and 
                             (isa_addr(9 downto 3) = BASE_ADDR_ROM(to_integer(unsigned(base_addr_val)))) else '0';
 
     isa_data <= data_out when (isa_reset = '0') and (device_select = '1') and (isa_ior = '0') else (others => 'Z');
 
     enable_IRQ <= enable_mouse and mdm_ctl_reg(3);               -- OUT2 разрешает прерывания
-    IRQ_state <= (RxD_IRQ and int_ena_reg(0)) or int_ena_reg(1); -- TxD_IRQ всегда выставлен
+--    IRQ_state <= (RxD_IRQ and int_ena_reg(0)) or int_ena_reg(1); -- TxD_IRQ всегда выставлен
+    IRQ_state <= (RxD_IRQ and int_ena_reg(0));                   -- Игнорируем TxD_IRQ
 
      -- OUT2 разрешает прерывания
     IRQ4 <= '0' when (IRQ_state = '0') and (enable_IRQ = '1') and (base_addr_val(0) = '0') and

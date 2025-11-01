@@ -35,7 +35,7 @@
 #define TIMER1_CONST 0x4F // Регулирует скорость передачи SPI
 #define TIMER2_CONST 0x7F // Регулирует длительность послесвечения светодиода
 
-#define serial_rate 8 // Задержка при передаче данных без проверки 
+#define serial_rate 8     // Задержка в мс при передаче данных без проверки 
 
 #define GLUE(a, b)     a##b
 
@@ -548,6 +548,7 @@ void spi_init(void) {
         spi_reset_low();
     }
 
+    // Ждём инициализацию устройства
     while (!device_init) {
         mcu_sleep();
     }
@@ -675,7 +676,7 @@ static inline uint16_t adc_read(uint8_t channel) {
 uint8_t checkIRQ(uint8_t opt_com)
 {
     const uint16_t threshold_mean = 1000;
-    const uint16_t threshold_var  = 50;
+    const uint16_t threshold_var  = 60;
     const uint8_t ADC_SAMPLES = 12;
     uint32_t sumsq = 0;
     uint16_t sum = 0;
@@ -683,7 +684,7 @@ uint8_t checkIRQ(uint8_t opt_com)
 
     // Кратковременно подаём 0 на вход ADC
     DDR(ADC_PORT) |= _BV(IRQX_PIN);   // pin 26 IRQX как выход с лог 0
-    _delay_us(1);
+    _delay_us(5);
     DDR(ADC_PORT) &= ~_BV(IRQX_PIN);  // pin 26 IRQX как вход
     // Если вывод не подключен, он должен какое-то время держать 0
     _delay_us(1);
@@ -717,9 +718,9 @@ uint8_t checkIRQ(uint8_t opt_com)
      * 
      * Пороговые значения подобраны эмпирически:
      *   mean > 1000  → уровень лог.1
-     *   var < 50     → низкий шум
+     *   var < 3600   → низкий шум, квадрат дисперсии
      */
-    if (mean > threshold_mean && var < threshold_var)
+    if (mean > threshold_mean && var < (threshold_var*threshold_var))
         return IRQX_PIN;
 
     if (opt_com == SELECT_COM1 || opt_com == SELECT_COM3) {
@@ -883,7 +884,6 @@ static void init(void) {
     ps2_init();
     ps2m_init();
 
-//    allow_send_data = true;
     mouse_enabled = get_mouse_power_state();
     mouse_start = true;
 }
@@ -893,16 +893,13 @@ static inline void send_mouse_id(void) {
     // Имитация переходных процессов при включении
     _delay_ms(20);
 
-    // Дожидаемся передачи
-    while(spi_tx_buf_count) ;
-
     // Не передаем ID при кратковременных включениях
     if (!mouse_enabled)
                     return;
 
     // Приветствие Logitech/Microsoft Plus
-    // Прерывание может быть запрещено
-    // передаем без проверки, со скоростью COM мыши
+    // Прерывание может быть запрещено, поэтому передаём
+    // без проверки готовности, со скоростью COM мыши
     SPI_SEND_PACKET(0x4D); _delay_ms(serial_rate); // Сигнатура MS mouse "M"
     if (ps2m_wheel) {
         SPI_SEND_PACKET(0x5A); _delay_ms(serial_rate); // Сигнатура мыши с колёсиком "Z"

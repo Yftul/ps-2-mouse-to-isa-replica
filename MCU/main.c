@@ -692,8 +692,7 @@ uint8_t checkIRQ(uint8_t opt_com)
     // Собираем ADC выборки
     for (uint8_t i = 0; i < ADC_SAMPLES; i++)
     {
-        adc_read(IRQX_PIN);
-        val = ADC;
+        val = adc_read(IRQX_PIN);
         sum += val;
         sumsq += (uint32_t)val * val;
     }

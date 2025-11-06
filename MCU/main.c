@@ -175,9 +175,19 @@ typedef enum {
 //===========================================================================
 // Скорость мыши
 // Допустимые значения: 10, 20, 40, 60, 80, 100, 200
-#define PS2_SAMPLES_PER_SEC_FAST    80 
-#define PS2_SAMPLES_PER_SEC_MID     40
-#define PS2_SAMPLES_PER_SEC_SLOW    20
+typedef enum {
+    PS2_SAMPLES_PER_SEC_10 = 10,
+    PS2_SAMPLES_PER_SEC_20 = 20,
+    PS2_SAMPLES_PER_SEC_40 = 40,
+    PS2_SAMPLES_PER_SEC_60 = 60,
+    PS2_SAMPLES_PER_SEC_80 = 80,
+    PS2_SAMPLES_PER_SEC_100 = 100,
+    PS2_SAMPLES_PER_SEC_200 = 200,
+} data_rate_t;
+
+#define PS2_SAMPLES_PER_SEC_FAST    PS2_SAMPLES_PER_SEC_80 
+#define PS2_SAMPLES_PER_SEC_MID     PS2_SAMPLES_PER_SEC_40
+#define PS2_SAMPLES_PER_SEC_SLOW    PS2_SAMPLES_PER_SEC_20
 
 //===========================================================================
 // Глобальные переменные
@@ -726,7 +736,6 @@ uint8_t checkIRQ(uint8_t opt_com)
         return IRQ4_PIN;
     }
     return IRQ3_PIN;
-
 }
 
 //---------------------------------------------------------------------------

@@ -203,7 +203,7 @@ volatile uint8_t ps2_state;
 volatile uint8_t ps2_bitcount;
 volatile uint8_t ps2_data;
 volatile uint8_t ps2_parity;
-uint8_t ps2_rx_buf[PS2_BUF_SIZE];
+volatile uint8_t ps2_rx_buf[PS2_BUF_SIZE];
 volatile uint8_t ps2_rx_buf_w;
 volatile uint8_t ps2_rx_buf_r;
 volatile uint8_t ps2_rx_buf_count;
@@ -214,7 +214,7 @@ uint8_t opt_duty_settings;
 uint8_t opt_rate_settings;
 uint8_t opt_irq_settings;
 
-uint8_t spi_tx_buf[SPI_TX_BUFFER_SIZE];
+volatile uint8_t spi_tx_buf[SPI_TX_BUFFER_SIZE];
 volatile uint8_t spi_tx_buf_w;
 volatile uint8_t spi_tx_buf_r;
 volatile uint8_t spi_tx_buf_count;
@@ -245,10 +245,16 @@ static inline void mcu_sleep(void) {
 
 //---------------------------------------------------------------------------
 // Ограничение переменной значениями [min, max]
-static inline int8_t clamp(int16_t val, int8_t min, int8_t max) {
+static inline int8_t clamp8(int16_t val, int8_t min, int8_t max) {
     if (val < (int16_t)min) return min;
     if (val > (int16_t)max) return max;
     return (int8_t)val;
+}
+
+static inline int16_t clamp16(int16_t val, int16_t min, int16_t max) {
+    if (val < min) return min;
+    if (val > max) return max;
+    return val;
 }
 
 //===========================================================================
@@ -653,7 +659,7 @@ void spi_m_send(int8_t x, int8_t y, int8_t z, uint8_t b) {
     right_b = (b >> 1) & 1;
     middle_b = (b >> 2) & 1;
 
-    spi_send((1 << 6) | (left_b<< 5) | (right_b << 4) |
+    spi_send((1 << 6) | (left_b << 5) | (right_b << 4) |
                       ((y & 0xC0) >> 4) | ((x & 0xC0) >> 6));
     spi_send(x & 0x3F);
     spi_send(y & 0x3F);
@@ -935,9 +941,9 @@ static inline void do_process(void) {
     // Полностью выбираем принятые пакеты
     while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
         m_bt = ps2_read() & (ps2m_wheel?7:3);
-        m_cx += (int8_t)ps2_read();
-        m_cy -= (int8_t)ps2_read();
-        m_cz += ps2m_wheel?(int8_t)ps2_read():0;
+        m_cx = clamp16(m_cx + (int8_t)ps2_read(), -15000, 15000);
+        m_cy = clamp16(m_cy - (int8_t)ps2_read(), -15000, 15000);
+        m_cz = ps2m_wheel?clamp16(m_cz + (int8_t)ps2_read(), -15000, 15000) : 0;
     }
 
     // Мышь включена и таймер следующей посылки активен
@@ -967,11 +973,11 @@ static inline void do_process(void) {
         if (likely(dr_ctr >= opt_duty_settings)) {
             // Передаём, если что-то изменилось
             if (m_bt != st_m_bt || m_cx || m_cy || m_cz) {
-                int8_t cx = clamp(m_cx, -128, 127);
+                int8_t cx = clamp8(m_cx, -128, 127);
                 m_cx -= cx;
-                int8_t cy = clamp(m_cy, -128, 127);
+                int8_t cy = clamp8(m_cy, -128, 127);
                 m_cy -= cy;
-                int8_t cz = clamp(m_cz, -8, 7);
+                int8_t cz = clamp8(m_cz, -8, 7);
                 m_cz -= cz;
 
                 st_m_bt = m_bt;

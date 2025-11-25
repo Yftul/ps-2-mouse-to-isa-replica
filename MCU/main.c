@@ -940,7 +940,7 @@ static inline void do_process(void) {
 
     // Полностью выбираем принятые пакеты
     while (ps2_rx_buf_count >= (ps2m_wheel ? 4 : 3)) {
-        m_bt = ps2_read() & (ps2m_wheel?7:3);
+        m_bt = ps2_read() & 0x07;
         m_cx = clamp16(m_cx + (int8_t)ps2_read(), -15000, 15000);
         m_cy = clamp16(m_cy - (int8_t)ps2_read(), -15000, 15000);
         m_cz = ps2m_wheel?clamp16(m_cz + (int8_t)ps2_read(), -15000, 15000) : 0;
